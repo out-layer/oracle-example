@@ -895,6 +895,7 @@ async fn poll_and_update(
 
     let all_tokens: Vec<String> = exchange_configs.keys().cloned().collect();
     let api_key = env::var("API_KEY").ok();
+    let pyth_api_key = env::var(oracle_example_sources::sources::PYTH_API_KEY_ENV).ok();
 
     // 1. Fetch current prices from external sources (for comparison only!)
     //
@@ -913,8 +914,13 @@ async fn poll_and_update(
         .iter()
         .map(|(token, cfg)| (token.clone(), cfg.without_sources(&config.slow_sources)))
         .collect();
-    let batched =
-        sources::fetch_all_sources_batch(client, &comparison_configs, api_key.as_deref()).await;
+    let batched = sources::fetch_all_sources_batch(
+        client,
+        &comparison_configs,
+        api_key.as_deref(),
+        pyth_api_key.as_deref(),
+    )
+    .await;
 
     let mut current_prices: HashMap<String, f64> = HashMap::new();
     for token in &all_tokens {

@@ -69,7 +69,17 @@ price a stablecoin independently of USDT. `okx`, `bitget` and `mexc` are USDT-qu
 
 Notes:
 - **CoinGecko** accepts an optional API key via the `API_KEY` secret (sent as
-  `x_cg_pro_api_key`); all other exchanges are keyless.
+  `x_cg_pro_api_key`).
+- **Pyth** requires one: Hermes serves prices only with `Authorization: Bearer <key>`, and
+  keys are issued by [Pyth Terminal](https://pythdata.app/signup) with per-feed grants (a key
+  without a grant for a feed gets `403 Not entitled`). The key lives in the `PYTH_API_KEY`
+  secret — its own name, never the CoinGecko `API_KEY`, since the two go to different
+  providers. Without the secret Pyth is not requested at all: no call, no per-token error,
+  the venue is simply absent from every record, exactly as if no asset configured it. The
+  `pyth` entries in the asset configs can therefore stay in place while the key is missing.
+  A request that names Pyth explicitly (`fetch_external` / `fetch_custom_data` with source
+  `Pyth`) is refused with a message naming the secret instead.
+- All other exchanges are keyless.
 - **Chainlink** reads Ethereum RPC with automatic multi-RPC failover; if every RPC fails,
   Chainlink is skipped for that run and an alert is sent. A single asset is read with
   `latestAnswer()`; a set of assets is read in one `eth_call` through Multicall3
@@ -137,6 +147,23 @@ seconds is answered from the venues seen within 40 seconds — the slow tier doe
 and the returned `publish_time` is the oldest source that did. Widening the window lets the slow
 tier back in and moves `publish_time` accordingly. A source that stops answering keeps its last
 observation for 15 minutes and then drops out of the record entirely.
+
+The window is anchored to the moment the request is evaluated. Which sources vote — on a cache
+hit and on the rebuild after a refetch alike — and whether `get_signed_prices` agrees to sign
+the result are one predicate taken against that one instant. The seconds the call itself takes
+to run are not counted against the caller's window, so a price that was inside `max_age_secs`
+when selected is never refused for having aged during the call; a consumer that checks
+`publish_time` on its own side should allow for its request latency on top of the window it
+asked for.
+
+A fetch does not change this. A plain refetch writes a merged record — what it observed plus the
+venues it did not reach, retained from earlier refreshes — and a request that excludes sources
+fetches without writing at all; either way the answer is the caller's window applied to what
+the fetch produced, never that set stamped with the fetch time. A venue outside the window
+neither votes nor ages `publish_time`, whether it is a retained entry from an earlier refresh or
+a Pyth reading fetched this instant whose own `publish_time` is older than the window. Fewer
+venues inside the window than `min_sources_num` is an error for that asset; the venues outside
+it do not make up the numbers.
 
 ## Custom data sources
 

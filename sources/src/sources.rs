@@ -23,6 +23,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// default, so every outbound request sets one explicitly.
 pub const USER_AGENT: &str = "oracle-example/1.0 (+https://github.com/out-layer/oracle-example)";
 
+/// The secret that carries the Pyth API key.
+///
+/// Hermes serves prices only with `Authorization: Bearer <key>` (keys are issued by Pyth
+/// Terminal and carry per-feed grants); without a key it answers 401 to every price request.
+/// So the key is a precondition for the venue, not a bonus: with it Pyth is fetched like any
+/// other source, without it Pyth is never requested and is simply absent from the record —
+/// exactly as if no asset configured it. Its own name, separate from the CoinGecko `API_KEY`,
+/// because the two go to different providers and must never be swapped.
+pub const PYTH_API_KEY_ENV: &str = "PYTH_API_KEY";
+
+/// A usable Pyth key: present and not blank. Blank is how an empty secret arrives.
+pub fn pyth_key(key: Option<&str>) -> Option<&str> {
+    key.map(str::trim).filter(|k| !k.is_empty())
+}
+
+/// The `Authorization` header value Hermes expects.
+pub fn pyth_authorization(key: &str) -> String {
+    format!("Bearer {}", key.trim())
+}
+
 /// WASI-only: the async (scheduler) build drives reqwest, which carries its own 30s total
 /// timeout set where the client is built.
 #[cfg(feature = "wasi")]
@@ -137,11 +157,21 @@ pub mod sync {
     use wasi_http_client::Client;
 
     fn http_get(url: &str) -> Result<HttpResponse> {
-        let response = Client::new()
+        http_get_with(url, None)
+    }
+
+    /// GET with an optional `Authorization` value. The only caller passing one is Pyth, whose
+    /// URL is built from a constant base — the credential never travels to a caller-supplied
+    /// host.
+    fn http_get_with(url: &str, authorization: Option<&str>) -> Result<HttpResponse> {
+        let mut request = Client::new()
             .get(url)
             .header("User-Agent", USER_AGENT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .send()?;
+            .connect_timeout(CONNECT_TIMEOUT);
+        if let Some(authorization) = authorization {
+            request = request.header("Authorization", authorization);
+        }
+        let response = request.send()?;
 
         let status = response.status();
         if status < 200 || status >= 300 {
@@ -218,9 +248,9 @@ pub mod sync {
         })
     }
 
-    pub fn fetch_pyth(price_id: &str) -> Result<SourcePrice> {
+    pub fn fetch_pyth(price_id: &str, api_key: &str) -> Result<SourcePrice> {
         let url = parsers::pyth_url(price_id);
-        let response = http_get(&url)?;
+        let response = http_get_with(&url, Some(&pyth_authorization(api_key)))?;
         let json: serde_json::Value = response.json()?;
         let (price, publish_time) = parsers::parse_pyth(&json)?;
 
@@ -534,7 +564,14 @@ pub mod sync {
     }
 
     /// Fetch price from all available sources for a token using exchange config
-    pub fn fetch_all_sources(config: &ExchangeConfig, api_key: Option<&str>) -> Vec<SourcePrice> {
+    ///
+    /// `pyth_api_key` gates Pyth: without a usable key the venue is not requested at all —
+    /// see `PYTH_API_KEY_ENV`.
+    pub fn fetch_all_sources(
+        config: &ExchangeConfig,
+        api_key: Option<&str>,
+        pyth_api_key: Option<&str>,
+    ) -> Vec<SourcePrice> {
         let mut prices = Vec::new();
 
         if let Some(ref cg_id) = config.coingecko {
@@ -561,8 +598,8 @@ pub mod sync {
             }
         }
 
-        if let Some(price_id) = config.pyth_id() {
-            if let Ok(p) = fetch_pyth(price_id) {
+        if let (Some(price_id), Some(key)) = (config.pyth_id(), pyth_key(pyth_api_key)) {
+            if let Ok(p) = fetch_pyth(price_id, key) {
                 prices.push(p);
             }
         }
@@ -646,11 +683,22 @@ pub mod sync {
     /// GET a batch endpoint, returning the status alongside the raw body so a caller can
     /// react to a specific status instead of only to "not 2xx".
     fn http_get_text_with_status(url: &str) -> Result<(u16, String)> {
-        let response = Client::new()
+        http_get_text_with_status_and(url, None)
+    }
+
+    /// The same, with an optional `Authorization` value — Pyth only, see `http_get_with`.
+    fn http_get_text_with_status_and(
+        url: &str,
+        authorization: Option<&str>,
+    ) -> Result<(u16, String)> {
+        let mut request = Client::new()
             .get(url)
             .header("User-Agent", USER_AGENT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .send()?;
+            .connect_timeout(CONNECT_TIMEOUT);
+        if let Some(authorization) = authorization {
+            request = request.header("Authorization", authorization);
+        }
+        let response = request.send()?;
 
         let status = response.status();
         Ok((status, String::from_utf8(response.body()?)?))
@@ -757,9 +805,13 @@ pub mod sync {
         parsers::parse_binance_alpha_batch(&body, contract_addresses)
     }
 
-    pub fn fetch_pyth_batch(price_ids: &[&str]) -> Result<parsers::BatchPrices> {
+    pub fn fetch_pyth_batch(price_ids: &[&str], api_key: &str) -> Result<parsers::BatchPrices> {
         let url = parsers::pyth_batch_url(price_ids);
-        let body = http_get_text(&url)?;
+        let (status, body) =
+            http_get_text_with_status_and(&url, Some(&pyth_authorization(api_key)))?;
+        if status < 200 || status >= 300 {
+            anyhow::bail!("HTTP {}", status);
+        }
         parsers::parse_pyth_batch(&body, price_ids)
     }
 
@@ -911,6 +963,7 @@ pub mod sync {
     pub fn fetch_all_sources_batch(
         configs: &HashMap<String, ExchangeConfig>,
         api_key: Option<&str>,
+        pyth_api_key: Option<&str>,
     ) -> HashMap<String, Vec<SourcePrice>> {
         let mut out: HashMap<String, Vec<SourcePrice>> = configs
             .keys()
@@ -961,11 +1014,23 @@ pub mod sync {
 
         let pyth = index_symbols(configs, |c| c.pyth_id());
         if !pyth.is_empty() {
-            let price_ids: Vec<&str> = pyth.keys().copied().collect();
-            match fetch_pyth_batch(&price_ids) {
-                // Same per-feed freshness rule as the single-feed path
-                Ok(prices) => fan_out(&mut out, &pyth, &prices, "pyth", pyth_publish_time),
-                Err(e) => eprintln!("pyth batch failed: {}", e),
+            match pyth_key(pyth_api_key) {
+                Some(key) => {
+                    let price_ids: Vec<&str> = pyth.keys().copied().collect();
+                    match fetch_pyth_batch(&price_ids, key) {
+                        // Same per-feed freshness rule as the single-feed path
+                        Ok(prices) => {
+                            fan_out(&mut out, &pyth, &prices, "pyth", pyth_publish_time)
+                        }
+                        Err(e) => eprintln!("pyth batch failed: {}", e),
+                    }
+                }
+                // Not an error: the venue is off until a key is configured
+                None => eprintln!(
+                    "pyth skipped for {} feed(s): {} is not set",
+                    pyth.len(),
+                    PYTH_API_KEY_ENV
+                ),
             }
         }
 
@@ -1206,9 +1271,17 @@ pub mod r#async {
         })
     }
 
-    pub async fn fetch_pyth(client: &reqwest::Client, price_id: &str) -> Result<SourcePrice> {
+    pub async fn fetch_pyth(
+        client: &reqwest::Client,
+        price_id: &str,
+        api_key: &str,
+    ) -> Result<SourcePrice> {
         let url = parsers::pyth_url(price_id);
-        let response = client.get(&url).send().await?;
+        let response = client
+            .get(&url)
+            .header("Authorization", pyth_authorization(api_key))
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             anyhow::bail!("HTTP {}", response.status());
@@ -1502,10 +1575,13 @@ pub mod r#async {
     }
 
     /// Fetch price from all available sources for a token using exchange config
+    ///
+    /// `pyth_api_key` gates Pyth exactly as in the sync backend — see `PYTH_API_KEY_ENV`.
     pub async fn fetch_all_sources(
         client: &reqwest::Client,
         config: &ExchangeConfig,
         api_key: Option<&str>,
+        pyth_api_key: Option<&str>,
     ) -> Vec<SourcePrice> {
         let mut prices = Vec::new();
 
@@ -1533,8 +1609,8 @@ pub mod r#async {
             }
         }
 
-        if let Some(price_id) = config.pyth_id() {
-            if let Ok(p) = fetch_pyth(client, price_id).await {
+        if let (Some(price_id), Some(key)) = (config.pyth_id(), pyth_key(pyth_api_key)) {
+            if let Ok(p) = fetch_pyth(client, price_id, key).await {
                 prices.push(p);
             }
         }
@@ -1735,6 +1811,7 @@ pub mod r#async {
         client: &reqwest::Client,
         configs: &std::collections::HashMap<String, ExchangeConfig>,
         api_key: Option<&str>,
+        pyth_api_key: Option<&str>,
     ) -> std::collections::HashMap<String, Vec<SourcePrice>> {
         use futures::future::join_all;
 
@@ -1749,7 +1826,22 @@ pub mod r#async {
         let ix_binance_us = index_symbols(configs, |c: &ExchangeConfig| c.binance_us.as_deref());
         let ix_binance_alpha =
             index_symbols(configs, |c: &ExchangeConfig| c.binance_alpha.as_deref());
-        let ix_pyth = index_symbols(configs, |c: &ExchangeConfig| c.pyth_id());
+        // Pyth is indexed only when it can be fetched: without a key the venue is not requested
+        // and drops out of the fan-out below like a venue no asset configures
+        let ix_pyth = match pyth_key(pyth_api_key) {
+            Some(_) => index_symbols(configs, |c: &ExchangeConfig| c.pyth_id()),
+            None => {
+                let configured = index_symbols(configs, |c: &ExchangeConfig| c.pyth_id()).len();
+                if configured > 0 {
+                    eprintln!(
+                        "pyth skipped for {} feed(s): {} is not set",
+                        configured, PYTH_API_KEY_ENV
+                    );
+                }
+                Default::default()
+            }
+        };
+        let pyth_authorization = pyth_key(pyth_api_key).map(pyth_authorization);
         let ix_chainlink = index_symbols(configs, |c: &ExchangeConfig| c.chainlink.as_deref());
         let ix_huobi = index_symbols(configs, |c: &ExchangeConfig| c.huobi.as_deref());
         let ix_kucoin = index_symbols(configs, |c: &ExchangeConfig| c.kucoin.as_deref());
@@ -1849,7 +1941,19 @@ pub mod r#async {
         });
 
         venue!(ix_pyth, "pyth", async {
-            let body = http_get_text(client, &parsers::pyth_batch_url(&s_pyth)).await?;
+            // `ix_pyth` is non-empty only when a key exists, so the header is always present here
+            let authorization = pyth_authorization.as_deref().unwrap_or_default();
+            let response = client
+                .get(parsers::pyth_batch_url(&s_pyth))
+                .header("Authorization", authorization)
+                .timeout(BATCH_REQUEST_TIMEOUT)
+                .send()
+                .await?;
+            let status = response.status().as_u16();
+            let body = response.text().await?;
+            if !(200..300).contains(&status) {
+                anyhow::bail!("HTTP {}", status);
+            }
             parsers::parse_pyth_batch(&body, &s_pyth)
         });
 
@@ -1919,5 +2023,32 @@ pub mod r#async {
         }
 
         out
+    }
+}
+
+#[cfg(test)]
+mod pyth_key_tests {
+    use super::{pyth_authorization, pyth_key, PYTH_API_KEY_ENV};
+
+    /// The key gates the venue, so "no key" has to mean exactly that — and a secret that was
+    /// created but left empty, or padded by a copy-paste, must not turn into a request that
+    /// Hermes refuses with a cryptic 400 on the header.
+    #[test]
+    fn a_blank_key_is_no_key_and_a_padded_one_is_trimmed() {
+        assert_eq!(pyth_key(None), None);
+        assert_eq!(pyth_key(Some("")), None);
+        assert_eq!(pyth_key(Some("   \n")), None);
+        assert_eq!(pyth_key(Some(" abc.def ")), Some("abc.def"));
+
+        assert_eq!(pyth_authorization("abc.def"), "Bearer abc.def");
+        assert_eq!(pyth_authorization(" abc.def\n"), "Bearer abc.def");
+    }
+
+    /// The secret is looked up by this exact name from three places (worker, scheduler, and
+    /// the operator who creates it); pin it so a rename cannot drift them apart.
+    #[test]
+    fn the_secret_name_is_pinned_and_distinct_from_the_coingecko_key() {
+        assert_eq!(PYTH_API_KEY_ENV, "PYTH_API_KEY");
+        assert_ne!(PYTH_API_KEY_ENV, "API_KEY");
     }
 }

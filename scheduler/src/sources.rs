@@ -21,8 +21,9 @@ pub async fn fetch_all_sources_batch(
     client: &reqwest::Client,
     configs: &HashMap<String, ExchangeConfig>,
     api_key: Option<&str>,
+    pyth_api_key: Option<&str>,
 ) -> HashMap<String, Vec<SourcePrice>> {
-    shared::fetch_all_sources_batch(client, configs, api_key).await
+    shared::fetch_all_sources_batch(client, configs, api_key, pyth_api_key).await
 }
 
 /// Median of one token's batched source prices, for comparison against the worker's stored value.

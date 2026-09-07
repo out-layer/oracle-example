@@ -224,6 +224,7 @@ cargo run --release
 | `AGGREGATION_METHOD` | `median` | Aggregation: `median` / `average` / `weighted_average` (an alias of `average` — equal weights, no extra outlier resistance) |
 | `MIN_SOURCES_NUM` | `1` | Minimum sources required for valid price |
 | `API_KEY` | — | API key for premium price sources (CoinGecko Pro, etc.) |
+| `PYTH_API_KEY` | — | Pyth (Hermes) API key, only used if `pyth` is fetched here, i.e. removed from `SLOW_SOURCES`. The worker reads the same-named secret from its secrets profile; without it Pyth is skipped, not errored |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token for failure alerts |
 | `TELEGRAM_CHAT_ID` | — | Chat ID to send alerts to |
 | `RUST_LOG` | `info` | Log level: `trace` / `debug` / `info` / `warn` / `error` |

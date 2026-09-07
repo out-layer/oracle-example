@@ -7,6 +7,7 @@ mod types;
 
 use oracle_example_sources::parsers;
 use oracle_example_sources::sources::sync as shared_sources;
+use oracle_example_sources::sources::{pyth_key, PYTH_API_KEY_ENV};
 use oracle_example_sources::{ExchangeConfig, SourcePrice};
 use outlayer::storage;
 use storage_types::{SourceInfo, StoredPrice};
@@ -52,7 +53,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 aggregation_method,
                 min_sources_num,
             } => {
-                let response = handle_get_prices(&tokens, max_age_secs, aggregation_method, min_sources_num);
+                let response = handle_get_prices(
+                    &tokens,
+                    current_timestamp(),
+                    max_age_secs,
+                    aggregation_method,
+                    min_sources_num,
+                );
                 serde_json::to_string(&response)?
             }
             OracleCommand::GetSignedPrices {
@@ -226,6 +233,7 @@ fn handle_update_prices(
 
     // Get universal API key from environment (used for CoinGecko, etc.)
     let api_key = env::var("API_KEY").ok();
+    let pyth_api_key = env::var(PYTH_API_KEY_ENV).ok();
 
     // ONE request per distinct source for the whole token set — at most 16 — instead of the
     // ~66 (token, source) round-trips this used to issue. Storage still happens per token
@@ -248,7 +256,11 @@ fn handle_update_prices(
             .filter(|(_, config)| !tiered || !config.configured_sources().is_empty())
             .collect();
 
-    let batched = shared_sources::fetch_all_sources_batch(&selected, api_key.as_deref());
+    let batched = shared_sources::fetch_all_sources_batch(
+        &selected,
+        api_key.as_deref(),
+        pyth_api_key.as_deref(),
+    );
 
     for token in tokens {
         let token = token.to_string();
@@ -561,16 +573,91 @@ fn windowed_price(
     })
 }
 
+/// The result of a fetch, as the caller's window sees it.
+///
+/// `fetched` is whatever the fetch produced: the merged record a plain refetch wrote — this
+/// fetch's observations plus the venues it did not reach, retained from earlier refreshes — or
+/// just the observations themselves on the exclusion path, which writes nothing. Either way
+/// the answer is not that set stamped with the fetch time. A fetch time says nothing about a
+/// retained venue from two minutes ago, nor about Pyth, whose entry carries the feed's own
+/// `publish_time` and is admitted by the source up to 120 seconds old — and the signed feed
+/// gates on the stamp, so it would sign both as brand new. The caller asked for
+/// `max_age_secs`, so the answer is rebuilt over exactly the venues inside that window, the
+/// same way a cache hit is, and `timestamp` is the oldest of them. A venue outside the window
+/// — retained or just fetched — neither votes nor ages the result.
+///
+/// Too few venues inside the window is an error for this asset, never a thinner price
+/// presented as fresh; the venues outside the window do not make up the numbers.
+fn fresh_result(
+    token: String,
+    fetched: &StoredPrice,
+    now: u64,
+    max_age_secs: u64,
+    exclude: &[String],
+    aggregation_method: AggregationMethod,
+    min_sources_num: u8,
+) -> PriceResult {
+    if let Some(view) = windowed_price(
+        fetched,
+        now,
+        max_age_secs,
+        exclude,
+        aggregation_method,
+        min_sources_num,
+    ) {
+        return PriceResult {
+            token,
+            price: Some(view.price),
+            timestamp: Some(view.timestamp),
+            sources: Some(view.sources),
+            from_cache: Some(false),
+            error: None,
+        };
+    }
+
+    let in_window = fetched
+        .sources_within(now, max_age_secs)
+        .into_iter()
+        .filter(|s| !signed_prices::is_excluded(&s.name, exclude))
+        .count();
+    let error = if in_window < min_sources_num as usize {
+        format!(
+            "Not enough sources within max_age_secs={}: got {}, required {}",
+            max_age_secs, in_window, min_sources_num
+        )
+    } else {
+        // Same rule as the cached branch: no usable number is an error for this asset.
+        // handle_get_signed_prices refuses to sign a partial feed, so this asset failing
+        // fails the request rather than shipping a zero to a lending market.
+        format!(
+            "No usable price: {} source(s) within max_age_secs={}, none finite",
+            in_window, max_age_secs
+        )
+    };
+    PriceResult {
+        token,
+        price: None,
+        timestamp: None,
+        sources: None,
+        from_cache: None,
+        error: Some(error),
+    }
+}
+
 /// Handle get_prices command (blockchain requests)
 /// Returns cached prices if fresh, otherwise fetches new ones
+///
+/// `now` is the instant the caller's `max_age_secs` window is anchored to. The caller owns it
+/// so that every decision about which sources may vote — on a cache hit and on the rebuild
+/// after a refetch alike — and, in the signed path, the gate that follows, are all taken
+/// against the same clock.
 fn handle_get_prices(
     tokens: &[String],
+    now: u64,
     max_age_secs: u64,
     aggregation_method: AggregationMethod,
     min_sources_num: u8,
 ) -> CommandResponse {
-    let now = current_timestamp();
-
     // Load exchange configs from public storage
     let configs = match load_exchange_configs() {
         Ok(c) => c,
@@ -585,6 +672,7 @@ fn handle_get_prices(
 
     // Get universal API key for potential fresh fetches
     let api_key = env::var("API_KEY").ok();
+    let pyth_api_key = env::var(PYTH_API_KEY_ENV).ok();
 
     // Pass 1: resolve every token against the cache, collecting the ones that need a fetch
     let mut states: Vec<CacheState> = Vec::with_capacity(tokens.len());
@@ -667,6 +755,7 @@ fn handle_get_prices(
         Some(shared_sources::fetch_all_sources_batch(
             &configs_for(misses.into_iter(), &configs),
             api_key.as_deref(),
+            pyth_api_key.as_deref(),
         ))
     } else {
         None
@@ -693,6 +782,7 @@ fn handle_get_prices(
                     &token,
                     config,
                     api_key.as_deref(),
+                    pyth_api_key.as_deref(),
                     aggregation_method,
                     min_sources_num,
                 ),
@@ -701,14 +791,15 @@ fn handle_get_prices(
         };
 
         match fetched {
-            Ok(new_stored) => results.push(PriceResult {
+            Ok(new_stored) => results.push(fresh_result(
                 token,
-                price: Some(new_stored.price),
-                timestamp: Some(new_stored.timestamp),
-                sources: Some(new_stored.sources.iter().map(|s| s.name.clone()).collect()),
-                from_cache: Some(false),
-                error: None,
-            }),
+                &new_stored,
+                now,
+                max_age_secs,
+                &[],
+                aggregation_method,
+                min_sources_num,
+            )),
             Err(e) => results.push(match fallback {
                 CacheFallback::Empty => PriceResult {
                     token,
@@ -838,10 +929,19 @@ fn handle_get_signed_prices(
         }
     };
 
+    // One clock for the whole request. The window that decides which cached sources may
+    // vote and the gate below that refuses to sign anything older than `max_age_secs` are
+    // the same predicate, so they must be evaluated at the same instant. Sampling the clock
+    // twice lets the seconds between the two samples — storage reads for every asset, and a
+    // fetch when the cache misses — push a record that was just inside the window at
+    // selection time just outside it at signing time, and the request fails on a price that
+    // was, by its own rules, fresh.
+    let now = current_timestamp();
+
     // Without exclusions this is exactly get_prices (cache-or-fetch + cache write);
     // with exclusions the cache cannot be served as-is, see collect_prices_excluding_sources
     let results = if exclude.is_empty() {
-        let response = handle_get_prices(tokens, max_age_secs, aggregation_method, min_sources_num);
+        let response = handle_get_prices(tokens, now, max_age_secs, aggregation_method, min_sources_num);
         if response.prices.is_empty() {
             return signed_prices_error(
                 format_str,
@@ -854,6 +954,7 @@ fn handle_get_signed_prices(
     } else {
         match collect_prices_excluding_sources(
             tokens,
+            now,
             max_age_secs,
             aggregation_method,
             min_sources_num,
@@ -864,45 +965,10 @@ fn handle_get_signed_prices(
         }
     };
 
-    // A partial signed payload would be dangerous for a lending protocol: fail the whole
-    // request when an asset has no price, or is older than the caller asked for
-    let now = current_timestamp();
-    let mut priced: Vec<(String, f64, u64)> = Vec::with_capacity(results.len());
-    let mut failed: Vec<String> = Vec::new();
-
-    for result in &results {
-        match (result.price, result.timestamp) {
-            (Some(price), Some(timestamp)) if now.saturating_sub(timestamp) <= max_age_secs => {
-                priced.push((result.token.clone(), price, timestamp));
-            }
-            (Some(_), Some(timestamp)) => failed.push(format!(
-                "{}: price is {}s old, older than max_age_secs={}{}",
-                result.token,
-                now.saturating_sub(timestamp),
-                max_age_secs,
-                result
-                    .error
-                    .as_ref()
-                    .map(|e| format!(" ({})", e))
-                    .unwrap_or_default()
-            )),
-            _ => failed.push(format!(
-                "{}: {}",
-                result.token,
-                result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "no price available".to_string())
-            )),
-        }
-    }
-
-    if !failed.is_empty() {
-        return signed_prices_error(
-            format_str,
-            format!("Refusing to sign a partial feed: {}", failed.join("; ")),
-        );
-    }
+    let priced = match gate_signed_feed(&results, now, max_age_secs) {
+        Ok(p) => p,
+        Err(e) => return signed_prices_error(format_str, e),
+    };
 
     let entries = match signed_prices::build_entries(&priced, expo) {
         Ok(e) => e,
@@ -929,6 +995,69 @@ fn handle_get_signed_prices(
     }
 }
 
+/// Admit a collected feed to signing, or refuse the whole request.
+///
+/// A partial signed payload would be dangerous for a lending protocol, so one asset without
+/// a price, older than the caller asked for, or carrying an error, fails the request rather
+/// than shipping the rest. `now` must be the instant the caller's window was applied when the
+/// results were collected: a view built for `max_age_secs` at `now` then passes here by
+/// construction, and what this gate actually catches is the stale-cache fallback a failed
+/// refetch leaves behind, plus assets that resolved to no price at all.
+///
+/// The fallback is refused on its error alone, not only on its age. It is served precisely
+/// because the caller's requirements were not met — too few sources in the window and a
+/// refetch that failed — and it is the record's headline, aggregated with the record's own
+/// method over the canonical window, not the aggregate the caller asked for. `get_prices` may
+/// hand that out with the warning attached; a signature would strip the warning off.
+fn gate_signed_feed(
+    results: &[PriceResult],
+    now: u64,
+    max_age_secs: u64,
+) -> Result<Vec<(String, f64, u64)>, String> {
+    let mut priced: Vec<(String, f64, u64)> = Vec::with_capacity(results.len());
+    let mut failed: Vec<String> = Vec::new();
+
+    for result in results {
+        match (result.price, result.timestamp, &result.error) {
+            (Some(price), Some(timestamp), None)
+                if now.saturating_sub(timestamp) <= max_age_secs =>
+            {
+                priced.push((result.token.clone(), price, timestamp));
+            }
+            (Some(_), Some(timestamp), _) if now.saturating_sub(timestamp) > max_age_secs => {
+                failed.push(format!(
+                "{}: price is {}s old, older than max_age_secs={}{}",
+                result.token,
+                now.saturating_sub(timestamp),
+                max_age_secs,
+                result
+                    .error
+                    .as_ref()
+                    .map(|e| format!(" ({})", e))
+                    .unwrap_or_default()
+                ));
+            }
+            _ => failed.push(format!(
+                "{}: {}",
+                result.token,
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "no price available".to_string())
+            )),
+        }
+    }
+
+    if failed.is_empty() {
+        Ok(priced)
+    } else {
+        Err(format!(
+            "Refusing to sign a partial feed: {}",
+            failed.join("; ")
+        ))
+    }
+}
+
 /// Collect prices for a request that excludes some sources
 ///
 /// The cached "price:{token}" entry is aggregated over ALL configured sources, so it must
@@ -945,6 +1074,7 @@ fn handle_get_signed_prices(
 /// the canonical feed; failures are returned to the caller instead.
 fn collect_prices_excluding_sources(
     tokens: &[String],
+    now: u64,
     max_age_secs: u64,
     aggregation_method: AggregationMethod,
     min_sources_num: u8,
@@ -952,7 +1082,7 @@ fn collect_prices_excluding_sources(
 ) -> Result<Vec<PriceResult>, String> {
     let configs = load_exchange_configs()?;
     let api_key = env::var("API_KEY").ok();
-    let now = current_timestamp();
+    let pyth_api_key = env::var(PYTH_API_KEY_ENV).ok();
     let mut results = Vec::new();
 
     for token_ref in tokens {
@@ -1028,7 +1158,11 @@ fn collect_prices_excluding_sources(
             continue;
         }
 
-        let source_prices = shared_sources::fetch_all_sources(&filtered, api_key.as_deref());
+        let source_prices = shared_sources::fetch_all_sources(
+            &filtered,
+            api_key.as_deref(),
+            pyth_api_key.as_deref(),
+        );
 
         if source_prices.is_empty() {
             results.push(PriceResult {
@@ -1045,48 +1179,31 @@ fn collect_prices_excluding_sources(
             continue;
         }
 
-        if source_prices.len() < min_sources_num as usize {
-            results.push(PriceResult {
-                token,
-                price: None,
-                timestamp: None,
-                sources: None,
-                from_cache: None,
-                error: Some(format!(
-                    "Not enough sources: got {}, required {} (excluded: {})",
-                    source_prices.len(),
-                    min_sources_num,
-                    exclude.join(", ")
-                )),
-            });
-            continue;
-        }
-
-        let prices: Vec<f64> = source_prices.iter().map(|p| p.price).collect();
-        results.push(match signed_prices::aggregate(&prices, aggregation_method) {
-            Some(price) => PriceResult {
-                token,
-                price: Some(price),
-                timestamp: Some(current_timestamp()),
-                sources: Some(source_prices.iter().map(|p| p.source_name.clone()).collect()),
-                from_cache: Some(false),
-                error: None,
-            },
-            // Same rule as the cached branch: no usable number is an error for this asset.
-            // handle_get_signed_prices refuses to sign a partial feed, so this asset failing
-            // fails the request rather than shipping a zero to a lending market.
-            None => PriceResult {
-                token,
-                price: None,
-                timestamp: None,
-                sources: None,
-                from_cache: None,
-                error: Some(format!(
-                    "No usable price: {} source(s) answered, none finite",
-                    source_prices.len()
-                )),
-            },
-        });
+        // The observations as a record that is never written: `fresh_result` then applies the
+        // caller's window to it exactly as to a merged refetch, so a Pyth entry older than the
+        // window does not vote and the stamp is the oldest venue that did
+        let fetched = StoredPrice::new(
+            0.0,
+            now,
+            source_prices
+                .iter()
+                .map(|p| SourceInfo {
+                    name: p.source_name.clone(),
+                    price: p.price,
+                    timestamp: Some(p.timestamp),
+                })
+                .collect(),
+            aggregation_method.as_str(),
+        );
+        results.push(fresh_result(
+            token,
+            &fetched,
+            now,
+            max_age_secs,
+            exclude,
+            aggregation_method,
+            min_sources_num,
+        ));
     }
 
     Ok(results)
@@ -1115,11 +1232,13 @@ fn handle_force_update(
 
     // Get universal API key from environment
     let api_key = env::var("API_KEY").ok();
+    let pyth_api_key = env::var(PYTH_API_KEY_ENV).ok();
 
     // Same batched fetch as update_prices — force_update only differs in ignoring the cache
     let batched = shared_sources::fetch_all_sources_batch(
         &configs_for(tokens.iter().map(String::as_str), &configs),
         api_key.as_deref(),
+        pyth_api_key.as_deref(),
     );
 
     for token_ref in tokens {
@@ -1190,9 +1309,9 @@ fn handle_fetch_external(token_id: &str, source: &ExternalPriceSource) -> Extern
         ExternalPriceSource::Binance => shared_sources::fetch_binance(token_id)
             .map(|p| p.price)
             .map_err(|e| e.to_string()),
-        ExternalPriceSource::Pyth => shared_sources::fetch_pyth(token_id)
-            .map(|p| p.price)
-            .map_err(|e| e.to_string()),
+        ExternalPriceSource::Pyth => pyth_api_key_or_error()
+            .and_then(|key| shared_sources::fetch_pyth(token_id, &key).map_err(|e| e.to_string()))
+            .map(|p| p.price),
         ExternalPriceSource::Custom(config) => {
             sources::fetch_custom(config).map_err(|e| e.to_string())
         }
@@ -1230,17 +1349,33 @@ fn handle_fetch_external(token_id: &str, source: &ExternalPriceSource) -> Extern
     }
 }
 
+/// The Pyth key for a request that names Pyth explicitly. The aggregate paths silently leave
+/// Pyth out when the key is missing, because there the venue is one of many; a caller who asked
+/// for Pyth and nothing else gets told why there is no answer.
+fn pyth_api_key_or_error() -> Result<String, String> {
+    let key = env::var(PYTH_API_KEY_ENV).ok();
+    pyth_key(key.as_deref())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "Pyth requires the {} secret (Hermes serves prices only with an API key)",
+                PYTH_API_KEY_ENV
+            )
+        })
+}
+
 /// Fetch price from multiple sources and store in public storage
 /// Uses shared oracle-example-sources crate for consistency with scheduler
 fn fetch_and_store_price(
     token: &str,
     config: &ExchangeConfig,
     api_key: Option<&str>,
+    pyth_api_key: Option<&str>,
     aggregation_method: AggregationMethod,
     min_sources_num: u8,
 ) -> Result<StoredPrice, String> {
     // Use shared crate's fetch_all_sources with exchange config
-    let source_prices = shared_sources::fetch_all_sources(config, api_key);
+    let source_prices = shared_sources::fetch_all_sources(config, api_key, pyth_api_key);
 
     aggregate_and_store_price(token, &source_prices, aggregation_method, min_sources_num)
 }
@@ -1431,11 +1566,11 @@ fn handle_fetch_custom_data(requests: &[types::CustomDataRequest]) -> types::Cus
                         .map(|p| serde_json::json!(p.price))
                         .map_err(|e| e.to_string())
                 }
-                ExternalPriceSource::Pyth => {
-                    shared_sources::fetch_pyth(&req.token_id)
-                        .map(|p| serde_json::json!(p.price))
-                        .map_err(|e| e.to_string())
-                }
+                ExternalPriceSource::Pyth => pyth_api_key_or_error()
+                    .and_then(|key| {
+                        shared_sources::fetch_pyth(&req.token_id, &key).map_err(|e| e.to_string())
+                    })
+                    .map(|p| serde_json::json!(p.price)),
                 ExternalPriceSource::Custom(config) => {
                     // fetch_custom_value returns serde_json::Value based on value_type
                     sources::fetch_custom_value(config).map_err(|e| e.to_string())
@@ -1640,6 +1775,183 @@ mod tests {
         let view = windowed_price(&stored, 1_200, 40, &[], AggregationMethod::Median, 1).unwrap();
         assert_eq!(view.timestamp, 1_199);
         assert_eq!(view.sources, vec!["mexc".to_string()]);
+    }
+
+    fn priced(token: &str, price: Option<f64>, timestamp: Option<u64>, error: Option<&str>) -> PriceResult {
+        PriceResult {
+            token: token.to_string(),
+            price,
+            timestamp,
+            sources: None,
+            from_cache: None,
+            error: error.map(str::to_string),
+        }
+    }
+
+    /// The window and the signing gate are one predicate evaluated at one instant. A cache
+    /// view that the window admitted must therefore never be refused by the gate — including
+    /// the edge where the oldest voting source is exactly `max_age_secs` old. That is the
+    /// boundary a request lands on every time the fast tier stalls behind a full cycle: the
+    /// record is 57s old when selected, and the seconds this call takes are not the caller's
+    /// staleness to bear.
+    #[test]
+    fn a_view_admitted_by_the_window_is_never_refused_by_the_gate() {
+        let now = 1_200;
+        let max_age = 60;
+        let stored = StoredPrice::new(
+            100.0,
+            now,
+            vec![
+                source("mexc", 100.0, now - 3),
+                source("okx", 102.0, now - max_age), // exactly on the boundary
+                source("pyth", 500.0, now - max_age - 1), // just outside: does not vote
+            ],
+            "median",
+        );
+
+        let view = windowed_price(&stored, now, max_age, &[], AggregationMethod::Median, 1).unwrap();
+        assert_eq!(view.timestamp, now - max_age);
+        assert_eq!(view.sources.len(), 2);
+
+        let results = vec![priced("sol", Some(view.price), Some(view.timestamp), None)];
+        let admitted = gate_signed_feed(&results, now, max_age).unwrap();
+        assert_eq!(admitted, vec![("sol".to_string(), 101.0, now - max_age)]);
+
+        // Sampling the clock again after the call did its work is exactly the failure mode:
+        // the same view, one second later, would be refused for being 61s old.
+        let err = gate_signed_feed(&results, now + 1, max_age).unwrap_err();
+        assert!(err.contains("sol: price is 61s old, older than max_age_secs=60"), "{err}");
+    }
+
+    /// What the gate exists for: the stale-cache fallback a failed refetch leaves behind, and
+    /// assets that resolved to no price. Either one refuses the whole feed, and the reason
+    /// names the asset and carries the fetch error along.
+    #[test]
+    fn the_gate_refuses_a_partial_feed() {
+        let now = 1_200;
+
+        let stale = priced(
+            "sol",
+            Some(100.0),
+            Some(now - 300),
+            Some("Using stale cache, fetch failed: HTTP 429"),
+        );
+        let fresh = priced("near", Some(2.0), Some(now), None);
+        let err = gate_signed_feed(&[fresh.clone(), stale], now, 60).unwrap_err();
+        assert!(err.starts_with("Refusing to sign a partial feed: "), "{err}");
+        assert!(err.contains("sol: price is 300s old, older than max_age_secs=60 (Using stale cache, fetch failed: HTTP 429)"), "{err}");
+        assert!(!err.contains("near"), "a fresh asset is not part of the refusal: {err}");
+
+        // The fallback is refused on its error alone: inside the window by age, but the
+        // window was not satisfied (too few sources) and the number is the record's headline,
+        // not the caller's aggregate. `get_prices` serves it with the warning; a signature
+        // would drop the warning, so it does not get one.
+        let fallback_in_window = priced(
+            "sol",
+            Some(100.0),
+            Some(now - 10),
+            Some("Using stale cache, fetch failed: HTTP 429"),
+        );
+        let err = gate_signed_feed(&[fresh.clone(), fallback_in_window], now, 60).unwrap_err();
+        assert!(err.contains("sol: Using stale cache, fetch failed: HTTP 429"), "{err}");
+        assert!(!err.contains("s old"), "not an age refusal: {err}");
+
+        let missing = priced("sol", None, None, Some("No sources available"));
+        let err = gate_signed_feed(&[fresh.clone(), missing], now, 60).unwrap_err();
+        assert!(err.contains("sol: No sources available"), "{err}");
+
+        let unexplained = priced("sol", None, None, None);
+        let err = gate_signed_feed(&[unexplained], now, 60).unwrap_err();
+        assert!(err.contains("sol: no price available"), "{err}");
+
+        // A freshly fetched price is stamped at or after `now` and always passes
+        let fetched = priced("sol", Some(100.0), Some(now + 4), None);
+        assert_eq!(gate_signed_feed(&[fresh, fetched], now, 60).unwrap().len(), 2);
+    }
+
+    /// A refetch writes a merged record, so the venues that did not answer this time survive
+    /// from earlier refreshes. What goes back to the caller is not that record's headline
+    /// stamped with the write time — it is the caller's window applied to the record, exactly
+    /// as on a cache hit. A retained entry older than the window neither votes nor ages the
+    /// reported price; and when the fetch itself came back too thin, the retained entries do
+    /// not get to make up the numbers.
+    #[test]
+    fn a_refetch_is_served_through_the_callers_window_not_the_write_time() {
+        let now = 1_200;
+        let fetched = StoredPrice::new(
+            300.0, // headline over the canonical window, including the retained venue
+            now + 3, // written after the clock the request is anchored to
+            vec![
+                source("mexc", 100.0, now + 3),
+                source("okx", 102.0, now + 2),
+                source("chainlink", 500.0, now - 90), // retained from an earlier refresh
+            ],
+            "median",
+        );
+
+        let result = fresh_result("sol".to_string(), &fetched, now, 60, &[], AggregationMethod::Median, 1);
+        assert_eq!(result.price, Some(101.0));
+        assert_eq!(result.timestamp, Some(now + 2));
+        assert_eq!(result.sources, Some(vec!["mexc".to_string(), "okx".to_string()]));
+        assert_eq!(result.from_cache, Some(false));
+        assert!(result.error.is_none());
+
+        // a wider window lets the retained venue vote, and the stamp follows it
+        let wide = fresh_result("sol".to_string(), &fetched, now, 120, &[], AggregationMethod::Median, 1);
+        assert_eq!(wide.price, Some(102.0));
+        assert_eq!(wide.timestamp, Some(now - 90));
+
+        // two venues inside the window, three required: the one outside may not top it up
+        let thin = fresh_result("sol".to_string(), &fetched, now, 60, &[], AggregationMethod::Median, 3);
+        assert!(thin.price.is_none());
+        assert_eq!(
+            thin.error.as_deref(),
+            Some("Not enough sources within max_age_secs=60: got 2, required 3")
+        );
+    }
+
+    /// A fetch time is not the age of everything fetched. Pyth's entry carries the feed's own
+    /// `publish_time`, which the source admits up to 120 seconds old, so a request that keeps
+    /// Pyth and asks for a 60-second window must not have Pyth vote — nor be stamped with the
+    /// moment the HTTP call returned. This is the exclusion path's shape: nothing retained,
+    /// nothing written, just this fetch's observations put through the caller's window.
+    #[test]
+    fn a_just_fetched_pyth_entry_is_still_subject_to_the_window() {
+        let now = 1_200;
+        let fetched = StoredPrice::new(
+            0.0,
+            now,
+            vec![
+                source("mexc", 100.0, now),
+                source("kraken", 102.0, now),
+                source("pyth", 500.0, now - 90), // published 90s ago, fetched just now
+            ],
+            "median",
+        );
+        let exclude = ["chainlink".to_string()];
+
+        let tight = fresh_result("usdt".to_string(), &fetched, now, 60, &exclude, AggregationMethod::Median, 1);
+        assert_eq!(tight.price, Some(101.0));
+        assert_eq!(tight.timestamp, Some(now));
+        assert_eq!(tight.sources, Some(vec!["mexc".to_string(), "kraken".to_string()]));
+
+        // widen the window and Pyth votes, dragging the honest stamp with it
+        let wide = fresh_result("usdt".to_string(), &fetched, now, 120, &exclude, AggregationMethod::Median, 1);
+        assert_eq!(wide.price, Some(102.0));
+        assert_eq!(wide.timestamp, Some(now - 90));
+
+        // the exclusion list composes with the window, case-insensitively
+        let no_pyth = ["Pyth".to_string()];
+        let excluded = fresh_result("usdt".to_string(), &fetched, now, 120, &no_pyth, AggregationMethod::Median, 1);
+        assert_eq!(excluded.price, Some(101.0));
+        assert_eq!(excluded.timestamp, Some(now));
+
+        // and the count that decides "not enough" is the count inside the window, after exclusions
+        let thin = fresh_result("usdt".to_string(), &fetched, now, 60, &exclude, AggregationMethod::Median, 3);
+        assert_eq!(
+            thin.error.as_deref(),
+            Some("Not enough sources within max_age_secs=60: got 2, required 3")
+        );
     }
 
     /// Two commands still read an environment variable the caller names. `oracle_keys` reached
