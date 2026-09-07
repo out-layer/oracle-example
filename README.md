@@ -427,7 +427,7 @@ Create custom data feeds using OutLayer's WASI infrastructure.
 
 ### Prerequisites
 
-1. Read [WASI_TUTORIAL.md](https://github.com/fastnear/near-outlayer/blob/main/wasi-examples/WASI_TUTORIAL.md)
+1. Read [WASI_TUTORIAL.md](https://github.com/out-layer/outlayer/blob/main/wasi-examples/WASI_TUTORIAL.md)
 2. Familiarity with Rust and WASI
 
 ### Project Structure
@@ -573,7 +573,7 @@ oracle-example/
 - **OutLayer Platform:** https://app.outlayer.ai
 - **Integration Guide:** [integration.md](integration.md)
 - **SDK Reference:** [sdk.md](sdk.md)
-- **WASI Tutorial:** [WASI_TUTORIAL.md](https://github.com/fastnear/near-outlayer/blob/main/wasi-examples/WASI_TUTORIAL.md)
+- **WASI Tutorial:** [WASI_TUTORIAL.md](https://github.com/out-layer/outlayer/blob/main/wasi-examples/WASI_TUTORIAL.md)
 
 ---
 
