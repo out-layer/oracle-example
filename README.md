@@ -421,7 +421,92 @@ near view price-oracle-pyth.near get_price '{
 
 ---
 
-## Integration Guide #3: Building Your Own WASI Worker
+## Integration Guide #3: Signed Price Feed (HTTPS pull)
+
+Prices signed inside the enclave with a pinned Ed25519 key, fetched over HTTPS. No gas, no
+callback: the consumer verifies 64 bytes and enforces freshness itself. Verification code in
+JavaScript, Python, Rust and a NEAR receiver contract is on
+[price-oracle.outlayer.ai/docs#verifiable-prices](https://price-oracle.outlayer.ai/docs#verifiable-prices).
+
+### Request
+
+```bash
+curl -sX POST https://api.outlayer.ai/call/price-oracle.near/price-oracle \
+  -H "X-Payment-Key: $PAYMENT_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "input": {
+      "command": "get_signed_prices",
+      "tokens": ["wrap.near", "eth.bridge.near", "usdt.tether-token.near"],
+      "max_age_secs": 60,
+      "exclude_sources": ["pyth", "chainlink"]
+    },
+    "secrets_ref": { "profile": "oracle", "account_id": "price-oracle.near" }
+  }'
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `tokens` | required | Asset ids to price. Every one must resolve or the whole request fails: a partial signed feed is never produced |
+| `max_age_secs` | 120 | The freshness window. It filters venues: the price is aggregated over exactly the venues observed within it, and `publish_time` is the oldest of them. Too few venues inside the window → a live fetch; still too few → an error for that asset and no signature |
+| `exclude_sources` | none | Venues that must not contribute, e.g. ones you already consume yourself. Unknown names are rejected, never ignored |
+| `sig_format` | `json` | `json` or `borsh` |
+| `expo` | -8 | `price` is an integer scaled by `10^expo` |
+| `min_sources_num` | 1 | Minimum venues inside the window for an asset to be priced |
+
+`secrets_ref` is mandatory and always this value: it is what puts the signing key in the enclave.
+
+### Response
+
+The `output` of the call envelope:
+
+```json
+{
+  "success": true,
+  "payload": "{\"eth.bridge.near\":{\"price\":\"196837500000\",\"expo\":-8,\"publish_time\":1785149621},\"usdt.tether-token.near\":{\"price\":\"99908500\",\"expo\":-8,\"publish_time\":1785149622},\"wrap.near\":{\"price\":\"184283333\",\"expo\":-8,\"publish_time\":1785149621}}",
+  "signature": "<base64 of the 64-byte Ed25519 signature>",
+  "public_key": "ed25519:FU6EnB4UaAiDCAxvQPkRUu5QQExgzvKQAX891wMEX3rU",
+  "sig_format": "json",
+  "error": null
+}
+```
+
+`payload` is a string, and the string is the signed message: verify over its exact bytes and
+parse only afterwards. Keys are the oracle's own asset ids, sorted. `price` is an i64 sent as a
+decimal string. The public key is pinned; a changed key is a failure, not an update.
+
+### What `publish_time` is
+
+- **An observation time, not a response time.** Every venue is stamped when the enclave read
+  it, and `publish_time` is the oldest venue that contributed to that asset within your window.
+  An aggregate is no fresher than its stalest input, and that is the number that gets signed.
+- **The cache is refreshed in cycles, not per request.** A scheduler refreshes the asset set
+  continuously. The cadence is operator configuration, not part of the feed contract, and a
+  cycle occasionally runs longer when a venue answers slowly. A request the cache can satisfy
+  never touches a venue.
+- **Two polls inside one cycle return the same signed price with the same `publish_time`.**
+  Nothing was observed in between, and the value is still inside the window you asked for.
+  Treat it as "no new data". Only its age can make it wrong, and the age bound is your check.
+- **Assets in one response may carry different stamps.** A refresh writes the assets one at a
+  time over a few seconds, so a request that lands during a refresh sees the new stamp on the
+  assets already written and the previous one on the rest. Each is inside your window and
+  signed with its own stamp.
+- **Pushing on-chain:** drop every asset whose `publish_time` equals the one you last
+  submitted, and have the contract skip, not fail, a stamp that is not strictly newer. A hard
+  monotonic check turns every repeated poll into a rejected transaction.
+- **Fresher than the cache:** narrow `max_age_secs`. When the cache cannot satisfy the window
+  the enclave fetches live from the allowed venues inside the call, at a few seconds of latency.
+  The window is the guarantee; a refresh every N seconds is not.
+
+### Checks a consumer owns
+
+1. The signature, over the raw `payload` bytes, against the pinned key.
+2. The age: `now - publish_time` within your own bound, with your request latency allowed for.
+3. Replay, if you store prices: never overwrite with a stamp that is not strictly newer.
+4. Fail closed: no signature, no price.
+
+---
+
+## Integration Guide #4: Building Your Own WASI Worker
 
 Create custom data feeds using OutLayer's WASI infrastructure.
 

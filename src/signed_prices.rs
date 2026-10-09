@@ -132,7 +132,8 @@ impl SigFormat {
 
 /// One asset in the signed payload.
 /// `price` is scaled by `10^-expo`; `publish_time` is the unix second at which the TEE
-/// fetched and aggregated the sources behind this price.
+/// observed the oldest venue that contributed to this price — the age of the aggregate, not
+/// the time of the request that returned it.
 #[derive(Debug, Clone, Copy, PartialEq, BorshSerialize)]
 pub struct PriceEntry {
     pub price: i64,

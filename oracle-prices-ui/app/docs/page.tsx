@@ -556,8 +556,10 @@ Result: No human holds the signing key. Only verified TEE code can push prices.`
                   <code className="text-primary"> price</code> is an integer sent as a string (it is an i64; a JSON
                   number would lose precision in some parsers). Real price ={' '}
                   <code className="text-primary">price × 10^expo</code>, e.g. 184283333 × 10⁻⁸ = $1.84283333.
-                  <code className="text-primary"> publish_time</code> is the unix second at which the enclave read and
-                  aggregated the sources.
+                  <code className="text-primary"> publish_time</code> is the unix second at which the enclave observed
+                  the oldest venue that contributed to that asset&apos;s price — the age of the aggregate, not the time
+                  of your request. See{' '}
+                  <a href="#publish-time" className="text-primary hover:underline">what publish_time is</a>.
                 </p>
               </details>
 
@@ -678,10 +680,14 @@ impl Contract {
             let published = e.publish_time as u64;
             require!(now.saturating_sub(published) <= MAX_AGE_SECS, "price too old");
 
-            // 3. Replay guard: a signed payload stays valid forever, so refuse
-            //    anything that is not strictly newer than what we already store.
+            // 3. Replay guard: a signed payload stays valid forever, so never
+            //    overwrite with anything that is not strictly newer. Skip, do not
+            //    fail: an equal stamp is the normal result of polling inside one
+            //    refresh cycle, and a transaction that panics on it is wasted gas.
             if let Some(prev) = self.prices.get(&asset) {
-                require!(published > prev.publish_time, "not newer than stored");
+                if published <= prev.publish_time {
+                    continue;
+                }
             }
 
             self.prices.insert(asset, StoredPrice { price: e.price.0, expo: e.expo, publish_time: published });
@@ -691,8 +697,9 @@ impl Contract {
                 </pre>
                 <p className="text-dark-400 text-sm mt-3">
                   Three checks carry the whole design: the signature (authenticity), the age bound (freshness), and the
-                  strictly-increasing <code className="text-primary">publish_time</code> (replay). Drop any of them and
-                  an old but validly signed payload can be replayed later.
+                  strictly-newer <code className="text-primary">publish_time</code> rule (replay). Drop any of them and
+                  an old but validly signed payload can be replayed later. The third one skips rather than fails: a
+                  repeated stamp is what a poll inside one refresh cycle legitimately returns.
                 </p>
               </details>
 
@@ -724,6 +731,51 @@ repeated per entry:
                   <code className="text-primary">I64</code> covers both and needs no manual parse.
                 </p>
               </details>
+
+              <h3 id="publish-time" className="text-lg font-semibold text-white mb-4">
+                What <code className="text-primary">publish_time</code> is, and why two polls can return the same one
+              </h3>
+              <div className="card mb-6">
+                <ul className="list-disc list-inside text-dark-300 space-y-3">
+                  <li>
+                    <strong className="text-white">It is an observation time, not a response time.</strong> Every
+                    venue is stamped when the enclave read it. The price is aggregated over the venues inside your{' '}
+                    <code className="text-primary">max_age_secs</code> window, and{' '}
+                    <code className="text-primary">publish_time</code> is the oldest of them: an aggregate is no
+                    fresher than its stalest input, and that is the number that gets signed.
+                  </li>
+                  <li>
+                    <strong className="text-white">The cache is refreshed in cycles, not per request.</strong> A
+                    scheduler refreshes the asset set continuously. The cadence is operator configuration, not part of
+                    the feed contract, and a cycle occasionally runs longer when a venue answers slowly. A request the
+                    cache can satisfy never touches a venue.
+                  </li>
+                  <li>
+                    <strong className="text-white">So two polls inside one cycle return the same signed price with the
+                    same <code className="text-primary">publish_time</code>.</strong> Nothing was observed in between,
+                    and the value is still inside the window you asked for. Treat it as &quot;no new data&quot;. Only
+                    its age can make it wrong, and the age bound is your check.
+                  </li>
+                  <li>
+                    <strong className="text-white">Assets in one response may carry different stamps.</strong> A
+                    refresh writes the assets one at a time over a few seconds, so a request that lands during a
+                    refresh sees the new stamp on the assets already written and the previous one on the rest. Each is
+                    inside your window and signed with its own stamp.
+                  </li>
+                  <li>
+                    <strong className="text-white">If you push prices on-chain,</strong> drop every asset whose{' '}
+                    <code className="text-primary">publish_time</code> equals the one you last submitted before sending
+                    the transaction, and have the contract skip, not fail, a stamp that is not strictly newer — as the
+                    receiver above does. A hard monotonic check turns every repeated poll into a rejected transaction.
+                  </li>
+                  <li>
+                    <strong className="text-white">Need fresher observations than the cache gives you?</strong> Narrow{' '}
+                    <code className="text-primary">max_age_secs</code>. When the cache cannot satisfy the window the
+                    enclave fetches live from the allowed venues inside the call, at a few seconds of latency per
+                    request. The window is the guarantee; a refresh every N seconds is not.
+                  </li>
+                </ul>
+              </div>
 
               <h3 className="text-lg font-semibold text-white mb-4">Running it in production</h3>
               <ol className="list-decimal list-inside text-dark-300 space-y-3 mb-6">
@@ -757,10 +809,11 @@ repeated per entry:
                   server-side check.
                 </li>
                 <li>
-                  <strong className="text-white">Reject non-increasing timestamps</strong> if you write prices to a
-                  contract — that is what stops an old signed payload from being replayed. Note repeated polls within
-                  one refresh window legitimately return the same <code className="text-primary">publish_time</code>;
-                  treat that as &quot;no new data&quot;, not as an error.
+                  <strong className="text-white">Never store a non-increasing timestamp</strong> if you write prices to
+                  a contract — that is what stops an old signed payload from being replayed. Skip it rather than fail
+                  on it: repeated polls within one refresh cycle legitimately return the same{' '}
+                  <code className="text-primary">publish_time</code>, and that is &quot;no new data&quot;, not an
+                  error — see <a href="#publish-time" className="text-primary hover:underline">above</a>.
                 </li>
                 <li>
                   <strong className="text-white">Fail closed.</strong> A failed request or signature means no price —
