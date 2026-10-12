@@ -8,11 +8,11 @@ mod types;
 use oracle_example_sources::parsers;
 use oracle_example_sources::sources::sync as shared_sources;
 use oracle_example_sources::sources::{pyth_key, PYTH_API_KEY_ENV};
-use oracle_example_sources::{ExchangeConfig, SourcePrice};
+use oracle_example_sources::{ExchangeConfig, SourcePrice, VenueFailure};
 use outlayer::storage;
 use storage_types::{SourceInfo, StoredPrice};
 use types::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -59,6 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     max_age_secs,
                     aggregation_method,
                     min_sources_num,
+                    false,
+                    false,
                 );
                 serde_json::to_string(&response)?
             }
@@ -70,6 +72,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exclude_sources,
                 aggregation_method,
                 min_sources_num,
+                skip_failed_sources,
+                allow_partial,
+                report_sources,
             } => {
                 let response = handle_get_signed_prices(
                     &tokens,
@@ -79,6 +84,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     exclude_sources.as_deref(),
                     aggregation_method,
                     min_sources_num,
+                    SignedFeedOptions {
+                        skip_failed_sources,
+                        allow_partial,
+                        report_sources,
+                    },
                 );
                 serde_json::to_string(&response)?
             }
@@ -270,6 +280,7 @@ fn handle_update_prices(
                 price: None,
                 timestamp: None,
                 sources: None,
+                source_report: None,
                 from_cache: None,
                 error: Some("Token not in exchange config".to_string()),
             });
@@ -285,6 +296,7 @@ fn handle_update_prices(
                 price: None,
                 timestamp: None,
                 sources: None,
+                source_report: None,
                 from_cache: None,
                 error: Some(format!(
                     "No configured source in the requested tier (excluded: {})",
@@ -294,14 +306,20 @@ fn handle_update_prices(
             continue;
         }
 
-        let source_prices = batched.get(&token).map(Vec::as_slice).unwrap_or_default();
-        match aggregate_and_store_price(&token, source_prices, aggregation_method, min_sources_num) {
+        match aggregate_and_store_price(
+            &token,
+            batched.prices_of(&token),
+            batched.failures_of(&token),
+            aggregation_method,
+            min_sources_num,
+        ) {
             Ok(stored) => {
                 results.push(PriceResult {
                     token: token.clone(),
                     price: Some(stored.price),
                     timestamp: Some(stored.timestamp),
                     sources: Some(stored.sources.iter().map(|s| s.name.clone()).collect()),
+                    source_report: None,
                     from_cache: Some(false),
                     error: None,
                 });
@@ -312,6 +330,7 @@ fn handle_update_prices(
                     price: None,
                     timestamp: None,
                     sources: None,
+                    source_report: None,
                     from_cache: None,
                     error: Some(e),
                 });
@@ -542,6 +561,12 @@ struct WindowedPrice {
 ///
 /// `None` means too few sources survived the filter. Callers turn that into a refetch rather
 /// than an error — the record is a cache, not the last word.
+/// `skip_failed`: a venue whose most recent attempt failed (`StoredPrice::failures`) does not
+/// vote while the venues left inside the window still satisfy `min_sources_num`. Its retained
+/// observation is the oldest one by construction — a venue that keeps answering keeps
+/// overwriting its entry — so it is what holds `publish_time` back for everyone while the
+/// other venues move on. When the healthy set is too thin the failed venue votes after all:
+/// an asset with a single venue stays priced, honestly stamped, while that venue is down.
 fn windowed_price(
     stored: &StoredPrice,
     now: u64,
@@ -549,6 +574,7 @@ fn windowed_price(
     exclude: &[String],
     aggregation_method: AggregationMethod,
     min_sources_num: u8,
+    skip_failed: bool,
 ) -> Option<WindowedPrice> {
     let kept: Vec<&SourceInfo> = stored
         .sources_within(now, max_age_secs)
@@ -559,6 +585,21 @@ fn windowed_price(
     if kept.is_empty() || kept.len() < min_sources_num as usize {
         return None;
     }
+
+    let kept = if skip_failed {
+        let healthy: Vec<&SourceInfo> = kept
+            .iter()
+            .copied()
+            .filter(|s| stored.failure_of(&s.name).is_none())
+            .collect();
+        if healthy.is_empty() || healthy.len() < min_sources_num as usize {
+            kept
+        } else {
+            healthy
+        }
+    } else {
+        kept
+    };
 
     let prices: Vec<f64> = kept.iter().map(|s| s.price).collect();
     // A kept set that aggregates to nothing usable is a failure for this asset, never a zero
@@ -588,6 +629,7 @@ fn windowed_price(
 ///
 /// Too few venues inside the window is an error for this asset, never a thinner price
 /// presented as fresh; the venues outside the window do not make up the numbers.
+#[allow(clippy::too_many_arguments)]
 fn fresh_result(
     token: String,
     fetched: &StoredPrice,
@@ -596,6 +638,7 @@ fn fresh_result(
     exclude: &[String],
     aggregation_method: AggregationMethod,
     min_sources_num: u8,
+    skip_failed: bool,
 ) -> PriceResult {
     if let Some(view) = windowed_price(
         fetched,
@@ -604,12 +647,14 @@ fn fresh_result(
         exclude,
         aggregation_method,
         min_sources_num,
+        skip_failed,
     ) {
         return PriceResult {
             token,
             price: Some(view.price),
             timestamp: Some(view.timestamp),
             sources: Some(view.sources),
+            source_report: None,
             from_cache: Some(false),
             error: None,
         };
@@ -639,6 +684,7 @@ fn fresh_result(
         price: None,
         timestamp: None,
         sources: None,
+        source_report: None,
         from_cache: None,
         error: Some(error),
     }
@@ -651,12 +697,18 @@ fn fresh_result(
 /// so that every decision about which sources may vote — on a cache hit and on the rebuild
 /// after a refetch alike — and, in the signed path, the gate that follows, are all taken
 /// against the same clock.
+///
+/// `skip_failed` is `windowed_price`'s rule; `report` attaches a `SourceReport` per asset.
+/// Both are off for the on-chain `get_prices` command, whose shape does not change.
+#[allow(clippy::too_many_arguments)]
 fn handle_get_prices(
     tokens: &[String],
     now: u64,
     max_age_secs: u64,
     aggregation_method: AggregationMethod,
     min_sources_num: u8,
+    skip_failed: bool,
+    report: bool,
 ) -> CommandResponse {
     // Load exchange configs from public storage
     let configs = match load_exchange_configs() {
@@ -684,6 +736,7 @@ fn handle_get_prices(
                 price: None,
                 timestamp: None,
                 sources: None,
+                source_report: None,
                 from_cache: None,
                 error: Some("Token not in exchange config".to_string()),
             }));
@@ -701,19 +754,34 @@ fn handle_get_prices(
                     &[],
                     aggregation_method,
                     min_sources_num,
+                    skip_failed,
                 ) {
                     // Enough sources inside the caller's window — serve without fetching.
                     // Re-aggregating rather than returning `stored.price` also means the
                     // requested aggregation_method is honoured on a cache hit, which serving
                     // the stored scalar silently ignored.
-                    Some(view) => states.push(CacheState::Resolved(PriceResult {
-                        token,
-                        price: Some(view.price),
-                        timestamp: Some(view.timestamp),
-                        sources: Some(view.sources),
-                        from_cache: Some(true),
-                        error: None,
-                    })),
+                    Some(view) => {
+                        let source_report = report.then(|| {
+                            source_report(
+                                &configs[&token],
+                                Some(&stored),
+                                now,
+                                max_age_secs,
+                                &[],
+                                &view.sources,
+                                &[],
+                            )
+                        });
+                        states.push(CacheState::Resolved(PriceResult {
+                            token,
+                            price: Some(view.price),
+                            timestamp: Some(view.timestamp),
+                            sources: Some(view.sources),
+                            source_report,
+                            from_cache: Some(true),
+                            error: None,
+                        }))
+                    }
                     // Too few sources are recent enough for this caller — fetch fresh
                     None => states.push(CacheState::Miss {
                         token,
@@ -736,6 +804,7 @@ fn handle_get_prices(
                 price: None,
                 timestamp: None,
                 sources: None,
+                source_report: None,
                 from_cache: None,
                 error: Some(format!("Storage error: {}", e)),
             })),
@@ -772,10 +841,13 @@ fn handle_get_prices(
         };
 
         let fetched = match &batched {
-            Some(batched) => {
-                let source_prices = batched.get(&token).map(Vec::as_slice).unwrap_or_default();
-                aggregate_and_store_price(&token, source_prices, aggregation_method, min_sources_num)
-            }
+            Some(batched) => aggregate_and_store_price(
+                &token,
+                batched.prices_of(&token),
+                batched.failures_of(&token),
+                aggregation_method,
+                min_sources_num,
+            ),
             // Pass 1 already established that the token is configured
             None => match configs.get(&token) {
                 Some(config) => fetch_and_store_price(
@@ -791,26 +863,46 @@ fn handle_get_prices(
         };
 
         match fetched {
-            Ok(new_stored) => results.push(fresh_result(
-                token,
-                &new_stored,
-                now,
-                max_age_secs,
-                &[],
-                aggregation_method,
-                min_sources_num,
-            )),
+            Ok(new_stored) => {
+                let mut result = fresh_result(
+                    token,
+                    &new_stored,
+                    now,
+                    max_age_secs,
+                    &[],
+                    aggregation_method,
+                    min_sources_num,
+                    skip_failed,
+                );
+                if report {
+                    let voted = result.sources.clone().unwrap_or_default();
+                    result.source_report = Some(source_report(
+                        &configs[&result.token],
+                        Some(&new_stored),
+                        now,
+                        max_age_secs,
+                        &[],
+                        &voted,
+                        &[],
+                    ));
+                }
+                results.push(result)
+            }
             Err(e) => results.push(match fallback {
                 CacheFallback::Empty => PriceResult {
                     token,
                     price: None,
                     timestamp: None,
                     sources: None,
+                    source_report: None,
                     from_cache: None,
                     error: Some(format!("No cache and fetch failed: {}", e)),
                 },
                 // Return stale price with warning
                 CacheFallback::Stale(stored) => {
+                    let source_report = report.then(|| {
+                        source_report(&configs[&token], Some(&stored), now, max_age_secs, &[], &[], &[])
+                    });
                     // Report the honest age: the OLDEST source behind this record, not the time
                     // the record was written. Under tiered refresh those differ by minutes — a
                     // record touched 5s ago by the fast tier still carries Pyth and Chainlink
@@ -824,6 +916,7 @@ fn handle_get_prices(
                         price: Some(stored.price),
                         timestamp: Some(observed),
                         sources: Some(stored.sources.iter().map(|s| s.name.clone()).collect()),
+                        source_report,
                         from_cache: Some(true),
                         error: Some(format!("Using stale cache, fetch failed: {}", e)),
                     }
@@ -833,6 +926,7 @@ fn handle_get_prices(
                     price: None,
                     timestamp: None,
                     sources: None,
+                    source_report: None,
                     from_cache: None,
                     error: Some(format!(
                         "Cache parse error: {}, fetch error: {}",
@@ -860,7 +954,17 @@ fn signed_prices_error(sig_format: &str, error: String) -> SignedPricesResponse 
         public_key: None,
         sig_format: sig_format.to_string(),
         error: Some(error),
+        skipped: None,
+        sources: None,
     }
+}
+
+/// The caller's choices on `get_signed_prices` beyond what prices to fetch
+#[derive(Debug, Clone, Copy, Default)]
+struct SignedFeedOptions {
+    skip_failed_sources: bool,
+    allow_partial: bool,
+    report_sources: bool,
 }
 
 /// Handle get_signed_prices command - signed pull feed for external consumers
@@ -881,6 +985,7 @@ fn handle_get_signed_prices(
     exclude_sources: Option<&[String]>,
     aggregation_method: AggregationMethod,
     min_sources_num: u8,
+    options: SignedFeedOptions,
 ) -> SignedPricesResponse {
     // Resolve the payload format first — errors echo whatever the caller asked for
     let format = match signed_prices::SigFormat::parse(sig_format) {
@@ -941,7 +1046,15 @@ fn handle_get_signed_prices(
     // Without exclusions this is exactly get_prices (cache-or-fetch + cache write);
     // with exclusions the cache cannot be served as-is, see collect_prices_excluding_sources
     let results = if exclude.is_empty() {
-        let response = handle_get_prices(tokens, now, max_age_secs, aggregation_method, min_sources_num);
+        let response = handle_get_prices(
+            tokens,
+            now,
+            max_age_secs,
+            aggregation_method,
+            min_sources_num,
+            options.skip_failed_sources,
+            options.report_sources,
+        );
         if response.prices.is_empty() {
             return signed_prices_error(
                 format_str,
@@ -959,16 +1072,28 @@ fn handle_get_signed_prices(
             aggregation_method,
             min_sources_num,
             &exclude,
+            options.skip_failed_sources,
+            options.report_sources,
         ) {
             Ok(r) => r,
             Err(e) => return signed_prices_error(format_str, e),
         }
     };
 
-    let priced = match gate_signed_feed(&results, now, max_age_secs) {
-        Ok(p) => p,
-        Err(e) => return signed_prices_error(format_str, e),
-    };
+    // Built before the gate: a skipped asset's venues are exactly what a quality monitor
+    // wants to see, so the report covers every requested asset, priced or not
+    let sources = options.report_sources.then(|| {
+        results
+            .iter()
+            .map(|r| (r.token.clone(), r.source_report.clone().unwrap_or_default()))
+            .collect::<BTreeMap<String, Vec<SourceReport>>>()
+    });
+
+    let (priced, skipped) =
+        match gate_signed_feed(&results, now, max_age_secs, options.allow_partial) {
+            Ok(p) => p,
+            Err(e) => return signed_prices_error(format_str, e),
+        };
 
     let entries = match signed_prices::build_entries(&priced, expo) {
         Ok(e) => e,
@@ -992,8 +1117,14 @@ fn handle_get_signed_prices(
         public_key: Some(public_key),
         sig_format: format_str.to_string(),
         error: None,
+        skipped: options.allow_partial.then_some(skipped),
+        sources,
     }
 }
+
+/// What the gate admits to signing — `(asset_id, price, publish_time)` triples — and what it
+/// left out, which is empty unless `allow_partial` turned refusals into skips
+type AdmittedFeed = (Vec<(String, f64, u64)>, Vec<SkippedAsset>);
 
 /// Admit a collected feed to signing, or refuse the whole request.
 ///
@@ -1009,13 +1140,22 @@ fn handle_get_signed_prices(
 /// refetch that failed — and it is the record's headline, aggregated with the record's own
 /// method over the canonical window, not the aggregate the caller asked for. `get_prices` may
 /// hand that out with the warning attached; a signature would strip the warning off.
+///
+/// With `allow_partial` the same judgement is kept per asset instead of failing the request:
+/// what is admitted is signed, what is not is returned as `SkippedAsset`s with a reason, and
+/// the caller — who asked for this by name — decides what to do with the gap. The signed
+/// payload never carries a price for a skipped asset, so a consumer that forgets to look at
+/// `skipped` sees an absent key, never a wrong number. Nothing admitted at all is still an
+/// error: an empty signed payload is a message with no content.
 fn gate_signed_feed(
     results: &[PriceResult],
     now: u64,
     max_age_secs: u64,
-) -> Result<Vec<(String, f64, u64)>, String> {
+    allow_partial: bool,
+) -> Result<AdmittedFeed, String> {
     let mut priced: Vec<(String, f64, u64)> = Vec::with_capacity(results.len());
     let mut failed: Vec<String> = Vec::new();
+    let mut skipped: Vec<SkippedAsset> = Vec::new();
 
     for result in results {
         match (result.price, result.timestamp, &result.error) {
@@ -1025,10 +1165,11 @@ fn gate_signed_feed(
                 priced.push((result.token.clone(), price, timestamp));
             }
             (Some(_), Some(timestamp), _) if now.saturating_sub(timestamp) > max_age_secs => {
+                let age = now.saturating_sub(timestamp);
                 failed.push(format!(
                 "{}: price is {}s old, older than max_age_secs={}{}",
                 result.token,
-                now.saturating_sub(timestamp),
+                age,
                 max_age_secs,
                 result
                     .error
@@ -1036,26 +1177,124 @@ fn gate_signed_feed(
                     .map(|e| format!(" ({})", e))
                     .unwrap_or_default()
                 ));
+                skipped.push(SkippedAsset {
+                    asset_id: result.token.clone(),
+                    reason: SkipReason::PriceTooOld,
+                    age_secs: Some(age),
+                });
             }
-            _ => failed.push(format!(
-                "{}: {}",
-                result.token,
-                result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "no price available".to_string())
-            )),
+            _ => {
+                failed.push(format!(
+                    "{}: {}",
+                    result.token,
+                    result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "no price available".to_string())
+                ));
+                skipped.push(SkippedAsset {
+                    asset_id: result.token.clone(),
+                    reason: skip_reason_of(result.error.as_deref()),
+                    age_secs: None,
+                });
+            }
         }
     }
 
     if failed.is_empty() {
-        Ok(priced)
-    } else {
-        Err(format!(
+        return Ok((priced, skipped));
+    }
+    if !allow_partial {
+        return Err(format!(
             "Refusing to sign a partial feed: {}",
             failed.join("; ")
-        ))
+        ));
     }
+    if priced.is_empty() {
+        return Err(format!("No asset could be priced: {}", failed.join("; ")));
+    }
+    Ok((priced, skipped))
+}
+
+/// The reason code behind one of this worker's own per-asset error messages.
+///
+/// The messages are ours — built in this file from fixed shapes — so matching their leading
+/// words is matching our own vocabulary, not a venue's. Anything unrecognised is `NoPrice`.
+fn skip_reason_of(error: Option<&str>) -> SkipReason {
+    match error {
+        Some(e) if e.starts_with("Token not in exchange config") => SkipReason::UnknownAsset,
+        Some(e) if e.starts_with("Not enough sources") => SkipReason::NotEnoughSources,
+        Some(e) if e.contains("Not enough sources within") => SkipReason::NotEnoughSources,
+        Some(e) if e.contains("fetch failed") => SkipReason::FetchFailed,
+        _ => SkipReason::NoPrice,
+    }
+}
+
+/// Every configured venue of one asset and what it did for one answer.
+///
+/// `record` is what the answer was built from: the stored record on a cache hit or after a
+/// refetch, or the never-written record of this call's own observations on the exclusion
+/// path. `voted` are the venues `windowed_price` used; `live_failures` are venues this very
+/// call attempted and got nothing from. A failure mark remembered in the record is reported
+/// on whatever status the venue has — a venue can vote on a retained observation and still be
+/// known to have failed since; that is exactly the case `skip_failed_sources` exists for.
+fn source_report(
+    config: &ExchangeConfig,
+    record: Option<&StoredPrice>,
+    now: u64,
+    max_age_secs: u64,
+    exclude: &[String],
+    voted: &[String],
+    live_failures: &[VenueFailure],
+) -> Vec<SourceReport> {
+    config
+        .configured_sources()
+        .into_iter()
+        .map(|name| {
+            let entry = record.and_then(|r| {
+                r.sources
+                    .iter()
+                    .find(|s| s.name == name)
+                    .map(|s| s.effective_timestamp(r.timestamp))
+            });
+            let age_secs = entry.map(|observed| now.saturating_sub(observed));
+            let in_window = age_secs.map(|age| age <= max_age_secs).unwrap_or(false);
+            let live = live_failures.iter().find(|f| f.source == name);
+            let mark = record.and_then(|r| r.failure_of(name));
+
+            let status = if signed_prices::is_excluded(name, exclude) {
+                SourceStatus::Excluded
+            } else if voted.iter().any(|v| v == name) {
+                SourceStatus::Used
+            } else if live.is_some() {
+                SourceStatus::Failed
+            } else if in_window && mark.is_some() {
+                SourceStatus::SkippedFailed
+            } else if in_window {
+                SourceStatus::Unused
+            } else if entry.is_some() {
+                SourceStatus::OutsideWindow
+            } else {
+                SourceStatus::Missing
+            };
+
+            let (failed_at, reason, http_status) = match (live, mark) {
+                (Some(live), _) => (Some(now), Some(live.reason), live.status),
+                (None, Some(mark)) => (Some(mark.at), Some(mark.reason), mark.status),
+                (None, None) => (None, None, None),
+            };
+
+            SourceReport {
+                name: name.to_string(),
+                status,
+                observed_at: entry,
+                age_secs,
+                failed_at,
+                reason,
+                http_status,
+            }
+        })
+        .collect()
 }
 
 /// Collect prices for a request that excludes some sources
@@ -1072,6 +1311,7 @@ fn gate_signed_feed(
 /// and overwriting it with a subset aggregate would silently degrade every other consumer.
 /// For the same reason this path sends no Telegram alerts — it is a per-caller view, not
 /// the canonical feed; failures are returned to the caller instead.
+#[allow(clippy::too_many_arguments)]
 fn collect_prices_excluding_sources(
     tokens: &[String],
     now: u64,
@@ -1079,6 +1319,8 @@ fn collect_prices_excluding_sources(
     aggregation_method: AggregationMethod,
     min_sources_num: u8,
     exclude: &[String],
+    skip_failed: bool,
+    report: bool,
 ) -> Result<Vec<PriceResult>, String> {
     let configs = load_exchange_configs()?;
     let api_key = env::var("API_KEY").ok();
@@ -1095,6 +1337,7 @@ fn collect_prices_excluding_sources(
                     price: None,
                     timestamp: None,
                     sources: None,
+                    source_report: None,
                     from_cache: None,
                     error: Some("Token not in exchange config".to_string()),
                 });
@@ -1112,6 +1355,7 @@ fn collect_prices_excluding_sources(
                     price: None,
                     timestamp: None,
                     sources: None,
+                    source_report: None,
                     from_cache: None,
                     error: Some(format!("Storage error: {}", e)),
                 });
@@ -1120,20 +1364,25 @@ fn collect_prices_excluding_sources(
         };
 
         // Same windowed rebuild as the plain path, with the caller's exclusions applied on top
-        if let Some(stored) = cached {
+        if let Some(stored) = &cached {
             if let Some(view) = windowed_price(
-                &stored,
+                stored,
                 now,
                 max_age_secs,
                 exclude,
                 aggregation_method,
                 min_sources_num,
+                skip_failed,
             ) {
+                let source_report = report.then(|| {
+                    source_report(config, Some(stored), now, max_age_secs, exclude, &view.sources, &[])
+                });
                 results.push(PriceResult {
                     token,
                     price: Some(view.price),
                     timestamp: Some(view.timestamp),
                     sources: Some(view.sources),
+                    source_report,
                     from_cache: Some(true),
                     error: None,
                 });
@@ -1149,6 +1398,7 @@ fn collect_prices_excluding_sources(
                 price: None,
                 timestamp: None,
                 sources: None,
+                source_report: None,
                 from_cache: None,
                 error: Some(format!(
                     "every configured source is excluded (excluded: {})",
@@ -1158,18 +1408,23 @@ fn collect_prices_excluding_sources(
             continue;
         }
 
-        let source_prices = shared_sources::fetch_all_sources(
+        let live = shared_sources::fetch_all_sources(
             &filtered,
             api_key.as_deref(),
             pyth_api_key.as_deref(),
         );
+        let source_prices = live.prices;
 
         if source_prices.is_empty() {
+            let source_report = report.then(|| {
+                source_report(config, cached.as_ref(), now, max_age_secs, exclude, &[], &live.failures)
+            });
             results.push(PriceResult {
                 token,
                 price: None,
                 timestamp: None,
                 sources: None,
+                source_report,
                 from_cache: None,
                 error: Some(format!(
                     "No sources available (excluded: {})",
@@ -1195,7 +1450,7 @@ fn collect_prices_excluding_sources(
                 .collect(),
             aggregation_method.as_str(),
         );
-        results.push(fresh_result(
+        let mut result = fresh_result(
             token,
             &fetched,
             now,
@@ -1203,7 +1458,21 @@ fn collect_prices_excluding_sources(
             exclude,
             aggregation_method,
             min_sources_num,
-        ));
+            skip_failed,
+        );
+        if report {
+            let voted = result.sources.clone().unwrap_or_default();
+            result.source_report = Some(source_report(
+                config,
+                Some(&fetched),
+                now,
+                max_age_secs,
+                exclude,
+                &voted,
+                &live.failures,
+            ));
+        }
+        results.push(result);
     }
 
     Ok(results)
@@ -1249,20 +1518,27 @@ fn handle_force_update(
                 price: None,
                 timestamp: None,
                 sources: None,
+                source_report: None,
                 from_cache: None,
                 error: Some("Token not in exchange config".to_string()),
             });
             continue;
         }
 
-        let source_prices = batched.get(&token).map(Vec::as_slice).unwrap_or_default();
-        match aggregate_and_store_price(&token, source_prices, aggregation_method, min_sources_num) {
+        match aggregate_and_store_price(
+            &token,
+            batched.prices_of(&token),
+            batched.failures_of(&token),
+            aggregation_method,
+            min_sources_num,
+        ) {
             Ok(stored) => {
                 results.push(PriceResult {
                     token,
                     price: Some(stored.price),
                     timestamp: Some(stored.timestamp),
                     sources: Some(stored.sources.iter().map(|s| s.name.clone()).collect()),
+                    source_report: None,
                     from_cache: Some(false),
                     error: None,
                 });
@@ -1273,6 +1549,7 @@ fn handle_force_update(
                     price: None,
                     timestamp: None,
                     sources: None,
+                    source_report: None,
                     from_cache: None,
                     error: Some(e),
                 });
@@ -1375,9 +1652,15 @@ fn fetch_and_store_price(
     min_sources_num: u8,
 ) -> Result<StoredPrice, String> {
     // Use shared crate's fetch_all_sources with exchange config
-    let source_prices = shared_sources::fetch_all_sources(config, api_key, pyth_api_key);
+    let fetched = shared_sources::fetch_all_sources(config, api_key, pyth_api_key);
 
-    aggregate_and_store_price(token, &source_prices, aggregation_method, min_sources_num)
+    aggregate_and_store_price(
+        token,
+        &fetched.prices,
+        &fetched.failures,
+        aggregation_method,
+        min_sources_num,
+    )
 }
 
 /// Collect the exchange configs of the requested tokens, for one batched fetch.
@@ -1403,9 +1686,15 @@ where
 /// it, so a fast tier that skips Pyth and Chainlink does not erase them. The stored headline
 /// price is then aggregated over the merged sources inside `CANONICAL_WINDOW_SECS` — never over
 /// the raw merge, or a venue that died ten minutes ago would keep voting.
+///
+/// `failed` is what this refresh attempted and got nothing from. It is remembered in the record
+/// (`StoredPrice::failures`) so a reader may choose not to let such a venue's retained
+/// observation vote; the headline price here still lets it, which keeps the on-chain push and
+/// `get_prices` exactly as they were.
 fn aggregate_and_store_price(
     token: &str,
     source_prices: &[SourcePrice],
+    failed: &[VenueFailure],
     aggregation_method: AggregationMethod,
     min_sources_num: u8,
 ) -> Result<StoredPrice, String> {
@@ -1444,6 +1733,13 @@ fn aggregate_and_store_price(
         previous_sources,
         previous_timestamp,
         &fresh,
+        timestamp,
+        SOURCE_RETENTION_SECS,
+    );
+    let failures = storage_types::merge_failures(
+        previous.as_ref().map(|p| p.failures.as_slice()).unwrap_or(&[]),
+        &fresh,
+        failed,
         timestamp,
         SOURCE_RETENTION_SECS,
     );
@@ -1532,6 +1828,7 @@ fn aggregate_and_store_price(
     // and silently defeat the per-asset push throttle — harmless while refreshes were rarer
     // than the throttle window, fatal once the fast tier runs every few seconds.
     stored.last_contract_report = previous.as_ref().and_then(|p| p.last_contract_report);
+    stored.failures = failures;
 
     // Store in public storage
     let json =
@@ -1690,6 +1987,8 @@ fn handle_test_telegram(custom_message: Option<&str>) -> TestTelegramResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oracle_example_sources::FailureReason;
+    use storage_types::SourceFailure;
 
     fn source(name: &str, price: f64, timestamp: u64) -> SourceInfo {
         SourceInfo {
@@ -1717,7 +2016,7 @@ mod tests {
         );
 
         let tight =
-            windowed_price(&stored, 1_200, 40, &[], AggregationMethod::Median, 1).unwrap();
+            windowed_price(&stored, 1_200, 40, &[], AggregationMethod::Median, 1, false).unwrap();
         assert_eq!(tight.price, 101.0);
         assert_eq!(tight.timestamp, 1_190);
         assert_eq!(tight.sources.len(), 2);
@@ -1725,7 +2024,7 @@ mod tests {
 
         // widening lets the slow tier back in and drags the honest staleness bound with it
         let wide =
-            windowed_price(&stored, 1_200, 120, &[], AggregationMethod::Median, 1).unwrap();
+            windowed_price(&stored, 1_200, 120, &[], AggregationMethod::Median, 1, false).unwrap();
         assert_eq!(wide.sources.len(), 4);
         assert_eq!(wide.timestamp, 1_090);
 
@@ -1737,13 +2036,14 @@ mod tests {
             &["pyth".to_string(), "chainlink".to_string()],
             AggregationMethod::Median,
             1,
+            false,
         )
         .unwrap();
         assert_eq!(excluded.price, 101.0);
 
         // too few sources in the window is a refetch signal, never a served price
-        assert!(windowed_price(&stored, 1_200, 40, &[], AggregationMethod::Median, 3).is_none());
-        assert!(windowed_price(&stored, 1_200, 1, &[], AggregationMethod::Median, 1).is_none());
+        assert!(windowed_price(&stored, 1_200, 40, &[], AggregationMethod::Median, 3, false).is_none());
+        assert!(windowed_price(&stored, 1_200, 1, &[], AggregationMethod::Median, 1, false).is_none());
     }
 
     /// A record's write time is not its price's age. Under tiered refresh the fast tier touches
@@ -1772,7 +2072,7 @@ mod tests {
         );
 
         // and the windowed path agrees: a 40s window sees only the fresh venue
-        let view = windowed_price(&stored, 1_200, 40, &[], AggregationMethod::Median, 1).unwrap();
+        let view = windowed_price(&stored, 1_200, 40, &[], AggregationMethod::Median, 1, false).unwrap();
         assert_eq!(view.timestamp, 1_199);
         assert_eq!(view.sources, vec!["mexc".to_string()]);
     }
@@ -1783,6 +2083,7 @@ mod tests {
             price,
             timestamp,
             sources: None,
+            source_report: None,
             from_cache: None,
             error: error.map(str::to_string),
         }
@@ -1809,17 +2110,17 @@ mod tests {
             "median",
         );
 
-        let view = windowed_price(&stored, now, max_age, &[], AggregationMethod::Median, 1).unwrap();
+        let view = windowed_price(&stored, now, max_age, &[], AggregationMethod::Median, 1, false).unwrap();
         assert_eq!(view.timestamp, now - max_age);
         assert_eq!(view.sources.len(), 2);
 
         let results = vec![priced("sol", Some(view.price), Some(view.timestamp), None)];
-        let admitted = gate_signed_feed(&results, now, max_age).unwrap();
+        let admitted = gate_signed_feed(&results, now, max_age, false).unwrap().0;
         assert_eq!(admitted, vec![("sol".to_string(), 101.0, now - max_age)]);
 
         // Sampling the clock again after the call did its work is exactly the failure mode:
         // the same view, one second later, would be refused for being 61s old.
-        let err = gate_signed_feed(&results, now + 1, max_age).unwrap_err();
+        let err = gate_signed_feed(&results, now + 1, max_age, false).unwrap_err();
         assert!(err.contains("sol: price is 61s old, older than max_age_secs=60"), "{err}");
     }
 
@@ -1837,7 +2138,7 @@ mod tests {
             Some("Using stale cache, fetch failed: HTTP 429"),
         );
         let fresh = priced("near", Some(2.0), Some(now), None);
-        let err = gate_signed_feed(&[fresh.clone(), stale], now, 60).unwrap_err();
+        let err = gate_signed_feed(&[fresh.clone(), stale], now, 60, false).unwrap_err();
         assert!(err.starts_with("Refusing to sign a partial feed: "), "{err}");
         assert!(err.contains("sol: price is 300s old, older than max_age_secs=60 (Using stale cache, fetch failed: HTTP 429)"), "{err}");
         assert!(!err.contains("near"), "a fresh asset is not part of the refusal: {err}");
@@ -1852,21 +2153,21 @@ mod tests {
             Some(now - 10),
             Some("Using stale cache, fetch failed: HTTP 429"),
         );
-        let err = gate_signed_feed(&[fresh.clone(), fallback_in_window], now, 60).unwrap_err();
+        let err = gate_signed_feed(&[fresh.clone(), fallback_in_window], now, 60, false).unwrap_err();
         assert!(err.contains("sol: Using stale cache, fetch failed: HTTP 429"), "{err}");
         assert!(!err.contains("s old"), "not an age refusal: {err}");
 
         let missing = priced("sol", None, None, Some("No sources available"));
-        let err = gate_signed_feed(&[fresh.clone(), missing], now, 60).unwrap_err();
+        let err = gate_signed_feed(&[fresh.clone(), missing], now, 60, false).unwrap_err();
         assert!(err.contains("sol: No sources available"), "{err}");
 
         let unexplained = priced("sol", None, None, None);
-        let err = gate_signed_feed(&[unexplained], now, 60).unwrap_err();
+        let err = gate_signed_feed(&[unexplained], now, 60, false).unwrap_err();
         assert!(err.contains("sol: no price available"), "{err}");
 
         // A freshly fetched price is stamped at or after `now` and always passes
         let fetched = priced("sol", Some(100.0), Some(now + 4), None);
-        assert_eq!(gate_signed_feed(&[fresh, fetched], now, 60).unwrap().len(), 2);
+        assert_eq!(gate_signed_feed(&[fresh, fetched], now, 60, false).unwrap().0.len(), 2);
     }
 
     /// A refetch writes a merged record, so the venues that did not answer this time survive
@@ -1889,7 +2190,7 @@ mod tests {
             "median",
         );
 
-        let result = fresh_result("sol".to_string(), &fetched, now, 60, &[], AggregationMethod::Median, 1);
+        let result = fresh_result("sol".to_string(), &fetched, now, 60, &[], AggregationMethod::Median, 1, false);
         assert_eq!(result.price, Some(101.0));
         assert_eq!(result.timestamp, Some(now + 2));
         assert_eq!(result.sources, Some(vec!["mexc".to_string(), "okx".to_string()]));
@@ -1897,12 +2198,12 @@ mod tests {
         assert!(result.error.is_none());
 
         // a wider window lets the retained venue vote, and the stamp follows it
-        let wide = fresh_result("sol".to_string(), &fetched, now, 120, &[], AggregationMethod::Median, 1);
+        let wide = fresh_result("sol".to_string(), &fetched, now, 120, &[], AggregationMethod::Median, 1, false);
         assert_eq!(wide.price, Some(102.0));
         assert_eq!(wide.timestamp, Some(now - 90));
 
         // two venues inside the window, three required: the one outside may not top it up
-        let thin = fresh_result("sol".to_string(), &fetched, now, 60, &[], AggregationMethod::Median, 3);
+        let thin = fresh_result("sol".to_string(), &fetched, now, 60, &[], AggregationMethod::Median, 3, false);
         assert!(thin.price.is_none());
         assert_eq!(
             thin.error.as_deref(),
@@ -1930,24 +2231,24 @@ mod tests {
         );
         let exclude = ["chainlink".to_string()];
 
-        let tight = fresh_result("usdt".to_string(), &fetched, now, 60, &exclude, AggregationMethod::Median, 1);
+        let tight = fresh_result("usdt".to_string(), &fetched, now, 60, &exclude, AggregationMethod::Median, 1, false);
         assert_eq!(tight.price, Some(101.0));
         assert_eq!(tight.timestamp, Some(now));
         assert_eq!(tight.sources, Some(vec!["mexc".to_string(), "kraken".to_string()]));
 
         // widen the window and Pyth votes, dragging the honest stamp with it
-        let wide = fresh_result("usdt".to_string(), &fetched, now, 120, &exclude, AggregationMethod::Median, 1);
+        let wide = fresh_result("usdt".to_string(), &fetched, now, 120, &exclude, AggregationMethod::Median, 1, false);
         assert_eq!(wide.price, Some(102.0));
         assert_eq!(wide.timestamp, Some(now - 90));
 
         // the exclusion list composes with the window, case-insensitively
         let no_pyth = ["Pyth".to_string()];
-        let excluded = fresh_result("usdt".to_string(), &fetched, now, 120, &no_pyth, AggregationMethod::Median, 1);
+        let excluded = fresh_result("usdt".to_string(), &fetched, now, 120, &no_pyth, AggregationMethod::Median, 1, false);
         assert_eq!(excluded.price, Some(101.0));
         assert_eq!(excluded.timestamp, Some(now));
 
         // and the count that decides "not enough" is the count inside the window, after exclusions
-        let thin = fresh_result("usdt".to_string(), &fetched, now, 60, &exclude, AggregationMethod::Median, 3);
+        let thin = fresh_result("usdt".to_string(), &fetched, now, 60, &exclude, AggregationMethod::Median, 3, false);
         assert_eq!(
             thin.error.as_deref(),
             Some("Not enough sources within max_age_secs=60: got 2, required 3")
@@ -1982,6 +2283,199 @@ mod tests {
     /// `report_prices` transactions) passed the prefix check like any other. This asserts the
     /// signer is fixed, is a TEE-generated key, and is not the transaction key — the property
     /// that lets the feed skip a domain-separation tag.
+    fn mark(name: &str, at: u64, reason: FailureReason, status: Option<u16>) -> SourceFailure {
+        SourceFailure {
+            name: name.to_string(),
+            at,
+            reason,
+            status,
+        }
+    }
+
+    fn result(token: &str, price: Option<f64>, timestamp: Option<u64>, error: Option<&str>) -> PriceResult {
+        PriceResult {
+            token: token.to_string(),
+            price,
+            timestamp,
+            sources: price.map(|_| vec!["okx".to_string()]),
+            source_report: None,
+            from_cache: Some(true),
+            error: error.map(str::to_string),
+        }
+    }
+
+    /// The failing venue's retained observation is the oldest in the window, so it is what
+    /// holds `publish_time` for every caller while the others move on. With the flag it stops
+    /// voting while enough healthy venues remain; without enough of them — or without the
+    /// flag — it votes as before, so a single-venue asset stays priced and honestly stamped.
+    #[test]
+    fn a_failed_venue_stops_holding_the_stamp_while_enough_healthy_venues_remain() {
+        let now = 1_200;
+        let mut stored = StoredPrice::new(
+            0.0,
+            now,
+            vec![
+                source("mexc", 100.0, now - 5),
+                source("okx", 102.0, now - 6),
+                source("coingecko", 90.0, now - 55), // retained: its last attempt failed
+            ],
+            "median",
+        );
+        stored.failures = vec![mark("coingecko", now - 10, FailureReason::RateLimited, Some(429))];
+
+        // flag off: today's behaviour, the retained observation votes and holds the stamp
+        let held = windowed_price(&stored, now, 60, &[], AggregationMethod::Median, 1, false).unwrap();
+        assert_eq!(held.timestamp, now - 55);
+        assert_eq!(held.sources.len(), 3);
+        assert_eq!(held.price, 100.0);
+
+        // flag on: the healthy venues vote and the stamp follows them
+        let skipped = windowed_price(&stored, now, 60, &[], AggregationMethod::Median, 1, true).unwrap();
+        assert_eq!(skipped.timestamp, now - 6);
+        assert_eq!(skipped.sources, vec!["mexc".to_string(), "okx".to_string()]);
+        assert_eq!(skipped.price, 101.0);
+
+        // too few healthy venues for the caller's minimum: the failed venue votes after all
+        let thin = windowed_price(&stored, now, 60, &[], AggregationMethod::Median, 3, true).unwrap();
+        assert_eq!(thin.sources.len(), 3);
+        assert_eq!(thin.timestamp, now - 55);
+
+        // a single-venue asset stays priced on its failed venue
+        let mut lone = StoredPrice::new(0.0, now, vec![source("coingecko", 0.99, now - 55)], "median");
+        lone.failures = stored.failures.clone();
+        let lone_view = windowed_price(&lone, now, 60, &[], AggregationMethod::Median, 1, true).unwrap();
+        assert_eq!(lone_view.sources, vec!["coingecko".to_string()]);
+        assert_eq!(lone_view.timestamp, now - 55);
+
+        // outside the window the mark is moot: the venue does not vote either way
+        let narrow = windowed_price(&stored, now, 30, &[], AggregationMethod::Median, 1, true).unwrap();
+        assert_eq!(narrow.sources.len(), 2);
+    }
+
+    /// With `allow_partial` the gate keeps its judgement per asset: what passes is signed,
+    /// what does not is named with a reason. Nothing passing is still an error, and without
+    /// the flag the request fails exactly as before.
+    #[test]
+    fn allow_partial_signs_what_it_can_and_names_what_it_skips() {
+        let now = 1_200;
+        let fresh = result("sol", Some(100.0), Some(now - 5), None);
+        let stale = result("frax", Some(0.99), Some(now - 300), Some("Using stale cache, fetch failed: HTTP 429"));
+        let thin = result("dai", None, None, Some("Not enough sources within max_age_secs=60: got 0, required 1"));
+        let unknown = result("nope", None, None, Some("Token not in exchange config"));
+        let dead = result("zec", None, None, Some("No cache and fetch failed: No sources available for token: zec"));
+
+        assert!(gate_signed_feed(&[fresh.clone(), stale.clone()], now, 60, false).is_err());
+
+        let (priced, skipped) = gate_signed_feed(
+            &[fresh.clone(), stale, thin.clone(), unknown, dead],
+            now,
+            60,
+            true,
+        )
+        .unwrap();
+        assert_eq!(priced, vec![("sol".to_string(), 100.0, now - 5)]);
+        assert_eq!(
+            skipped,
+            vec![
+                SkippedAsset { asset_id: "frax".into(), reason: SkipReason::PriceTooOld, age_secs: Some(300) },
+                SkippedAsset { asset_id: "dai".into(), reason: SkipReason::NotEnoughSources, age_secs: None },
+                SkippedAsset { asset_id: "nope".into(), reason: SkipReason::UnknownAsset, age_secs: None },
+                SkippedAsset { asset_id: "zec".into(), reason: SkipReason::FetchFailed, age_secs: None },
+            ]
+        );
+
+        let err = gate_signed_feed(&[thin], now, 60, true).unwrap_err();
+        assert!(err.starts_with("No asset could be priced: dai: Not enough sources"), "{err}");
+
+        let (_, none) = gate_signed_feed(&[fresh], now, 60, true).unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// Every configured venue appears once, with what it did for this answer. A remembered
+    /// failure is reported whatever the venue's status, because a venue can vote on a retained
+    /// observation and still be known to have failed since.
+    #[test]
+    fn the_source_report_names_every_configured_venue_and_what_it_did() {
+        let now = 1_200;
+        let config = ExchangeConfig {
+            coingecko: Some("near".into()),
+            okx: Some("NEAR-USDT".into()),
+            kraken: Some("NEARUSD".into()),
+            pyth: Some("abc".into()),
+            chainlink: Some("0x1".into()),
+            mexc: Some("NEARUSDT".into()),
+            ..Default::default()
+        };
+        let mut stored = StoredPrice::new(
+            0.0,
+            now,
+            vec![
+                source("okx", 1.0, now - 5),
+                source("kraken", 1.0, now - 7),
+                source("coingecko", 1.0, now - 50),
+                source("chainlink", 1.0, now - 200),
+            ],
+            "median",
+        );
+        stored.failures = vec![mark("coingecko", now - 20, FailureReason::RateLimited, Some(429))];
+        let voted = vec!["okx".to_string(), "kraken".to_string()];
+        let live = vec![VenueFailure::new("mexc", FailureReason::Timeout)];
+
+        let report = source_report(&config, Some(&stored), now, 60, &["pyth".to_string()], &voted, &live);
+        assert_eq!(report.len(), 6);
+        let of = |name: &str| report.iter().find(|r| r.name == name).unwrap().clone();
+
+        let okx = of("okx");
+        assert_eq!((okx.status, okx.observed_at, okx.age_secs, okx.reason), (SourceStatus::Used, Some(now - 5), Some(5), None));
+        let coingecko = of("coingecko");
+        assert_eq!(coingecko.status, SourceStatus::SkippedFailed);
+        assert_eq!((coingecko.age_secs, coingecko.failed_at, coingecko.reason, coingecko.http_status),
+                   (Some(50), Some(now - 20), Some(FailureReason::RateLimited), Some(429)));
+        let chainlink = of("chainlink");
+        assert_eq!((chainlink.status, chainlink.age_secs), (SourceStatus::OutsideWindow, Some(200)));
+        let pyth = of("pyth");
+        assert_eq!((pyth.status, pyth.observed_at), (SourceStatus::Excluded, None));
+        let mexc = of("mexc");
+        assert_eq!((mexc.status, mexc.observed_at, mexc.failed_at, mexc.reason),
+                   (SourceStatus::Failed, None, Some(now), Some(FailureReason::Timeout)));
+
+        // nothing voted — the asset failed — so an in-window venue is unused, not used
+        let none_voted = source_report(&config, Some(&stored), now, 60, &[], &[], &[]);
+        assert_eq!(none_voted.iter().find(|r| r.name == "okx").unwrap().status, SourceStatus::Unused);
+
+        // no record at all: everything configured is missing
+        let empty = source_report(&config, None, now, 60, &[], &[], &[]);
+        assert!(empty.iter().all(|r| r.status == SourceStatus::Missing && r.observed_at.is_none()));
+    }
+
+    /// The envelope keeps every field present — a client that reads `skipped` or `sources`
+    /// finds `null`, never a missing key — and every code is a snake_case string.
+    #[test]
+    fn the_signed_envelope_keeps_every_field_and_codes_are_snake_case() {
+        let err = serde_json::to_value(signed_prices_error("json", "x".to_string())).unwrap();
+        assert!(err.get("skipped").unwrap().is_null());
+        assert!(err.get("sources").unwrap().is_null());
+
+        let report = SourceReport {
+            name: "okx".into(),
+            status: SourceStatus::SkippedFailed,
+            observed_at: Some(1),
+            age_secs: Some(2),
+            failed_at: Some(3),
+            reason: Some(FailureReason::HttpError),
+            http_status: Some(503),
+        };
+        assert_eq!(
+            serde_json::to_string(&report).unwrap(),
+            r#"{"name":"okx","status":"skipped_failed","observed_at":1,"age_secs":2,"failed_at":3,"reason":"http_error","http_status":503}"#
+        );
+        let bare = SourceReport { name: "pyth".into(), status: SourceStatus::Excluded, observed_at: None, age_secs: None, failed_at: None, reason: None, http_status: None };
+        assert_eq!(serde_json::to_string(&bare).unwrap(), r#"{"name":"pyth","status":"excluded"}"#);
+
+        let skipped = SkippedAsset { asset_id: "a".into(), reason: SkipReason::PriceTooOld, age_secs: Some(61) };
+        assert_eq!(serde_json::to_string(&skipped).unwrap(), r#"{"asset_id":"a","reason":"price_too_old","age_secs":61}"#);
+    }
+
     #[test]
     fn feed_signing_key_is_pinned_and_transaction_free() {
         assert!(signed_prices::FEED_SIGNING_KEY.starts_with("PROTECTED_"));
@@ -2012,6 +2506,7 @@ mod tests {
             None,
             AggregationMethod::Median,
             1,
+            SignedFeedOptions::default(),
         );
         assert!(!signed.success);
         assert!(signed

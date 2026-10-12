@@ -121,6 +121,15 @@ upstream time that the parsers carry but the aggregator does not act on. See
 [the platform freshness docs](https://app.outlayer.ai/docs/tee-attestation#data-freshness)
 for how consumers should reason about age.
 
+A venue that was attempted and produced no price is remembered in the record
+(`StoredPrice.failures`: the venue, when, and a reason code — never the error text, which may
+quote a request URL carrying an API key). A fresh observation clears the mark; a refresh that
+did not attempt the venue leaves it alone, so a slow-tier pass never marks the fast venues it
+skipped. The mark changes nothing by itself: the headline price, `get_prices` and the on-chain
+push still let the venue's retained observation vote inside the window. Only a
+`get_signed_prices` caller that passes `skip_failed_sources` has such a venue sit out while
+enough healthy venues remain, and `report_sources` shows the marks per venue.
+
 ## Refresh tiers
 
 Sources are not all refreshed together. Each stored price keeps the **per-source observation

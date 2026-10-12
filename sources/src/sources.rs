@@ -4,7 +4,7 @@
 
 use crate::{parsers, ExchangeConfig, SourcePrice};
 #[cfg(feature = "wasi")]
-use crate::{CustomSourceConfig, HttpResponse};
+use crate::{CustomSourceConfig, FailureReason, FetchOutcome, HttpResponse, SingleFetch, VenueFailure};
 use anyhow::Result;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -133,6 +133,47 @@ pub(crate) fn fan_out<F>(
                     }
                 }
             }
+        }
+    }
+}
+
+/// `fan_out`, plus a failure for every asset the venue did not price.
+///
+/// A symbol absent from a successful batch is `PairMissing` — the venue answered, just not
+/// for this asset — and an entry the timestamp rule dropped is `StaleUpstream`. Only the
+/// WASI worker records failures: they are what it writes into the stored record, and the
+/// scheduler compares prices only.
+#[cfg(feature = "wasi")]
+pub(crate) fn fan_out_recording<F>(
+    out: &mut FetchOutcome,
+    index: &SymbolIndex<'_>,
+    prices: &parsers::BatchPrices,
+    source_name: &str,
+    resolve_timestamp: F,
+) where
+    F: Fn(&str, &parsers::BatchPrice) -> Option<u64>,
+{
+    fan_out(&mut out.prices, index, prices, source_name, &resolve_timestamp);
+    for (symbol, tokens) in index {
+        let reason = match prices.get(*symbol) {
+            None => FailureReason::PairMissing,
+            Some(entry) if resolve_timestamp(symbol, entry).is_none() => {
+                FailureReason::StaleUpstream
+            }
+            Some(_) => continue,
+        };
+        for token in tokens {
+            out.fail(token, VenueFailure::new(source_name, reason));
+        }
+    }
+}
+
+/// Record one venue's failure for every asset that asked it for a price
+#[cfg(feature = "wasi")]
+pub(crate) fn fail_venue(out: &mut FetchOutcome, index: &SymbolIndex<'_>, failure: VenueFailure) {
+    for tokens in index.values() {
+        for token in tokens {
+            out.fail(token, failure.clone());
         }
     }
 }
@@ -571,106 +612,175 @@ pub mod sync {
         config: &ExchangeConfig,
         api_key: Option<&str>,
         pyth_api_key: Option<&str>,
-    ) -> Vec<SourcePrice> {
-        let mut prices = Vec::new();
+    ) -> SingleFetch {
+        let mut out = SingleFetch::default();
 
         if let Some(ref cg_id) = config.coingecko {
-            if let Ok(p) = fetch_coingecko(cg_id, api_key) {
-                prices.push(p);
+            match fetch_coingecko(cg_id, api_key) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("coingecko failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("coingecko", &e));
+                }
             }
         }
 
         if let Some(ref symbol) = config.binance {
-            if let Ok(p) = fetch_binance(symbol) {
-                prices.push(p);
+            match fetch_binance(symbol) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("binance failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("binance", &e));
+                }
             }
         }
 
         if let Some(ref symbol) = config.binance_us {
-            if let Ok(p) = fetch_binance_us(symbol) {
-                prices.push(p);
+            match fetch_binance_us(symbol) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("binance_us failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("binance_us", &e));
+                }
             }
         }
 
         if let Some(ref address) = config.binance_alpha {
-            if let Ok(p) = fetch_binance_alpha(address) {
-                prices.push(p);
+            match fetch_binance_alpha(address) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("binance_alpha failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("binance_alpha", &e));
+                }
             }
         }
 
-        if let (Some(price_id), Some(key)) = (config.pyth_id(), pyth_key(pyth_api_key)) {
-            if let Ok(p) = fetch_pyth(price_id, key) {
-                prices.push(p);
+        if let Some(price_id) = config.pyth_id() {
+            match pyth_key(pyth_api_key) {
+                Some(key) => match fetch_pyth(price_id, key) {
+                    Ok(p) => out.prices.push(p),
+                    Err(e) => {
+                        eprintln!("pyth failed: {}", e);
+                        out.failures.push(VenueFailure::from_error("pyth", &e));
+                    }
+                },
+                None => out
+                    .failures
+                    .push(VenueFailure::new("pyth", FailureReason::NotConfigured)),
             }
         }
 
         if let Some(ref feed_address) = config.chainlink {
-            if let Ok(p) = fetch_chainlink(feed_address) {
-                prices.push(p);
+            match fetch_chainlink(feed_address) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("chainlink failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("chainlink", &e));
+                }
             }
         }
 
         if let Some(ref symbol) = config.huobi {
-            if let Ok(p) = fetch_huobi(symbol) {
-                prices.push(p);
+            match fetch_huobi(symbol) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("huobi failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("huobi", &e));
+                }
             }
         }
 
         if let Some(ref symbol) = config.kucoin {
-            if let Ok(p) = fetch_kucoin(symbol) {
-                prices.push(p);
+            match fetch_kucoin(symbol) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("kucoin failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("kucoin", &e));
+                }
             }
         }
 
         if let Some(ref pair) = config.gate {
-            if let Ok(p) = fetch_gate(pair) {
-                prices.push(p);
+            match fetch_gate(pair) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("gate failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("gate", &e));
+                }
             }
         }
 
         if let Some(ref instrument) = config.cryptocom {
-            if let Ok(p) = fetch_cryptocom(instrument) {
-                prices.push(p);
+            match fetch_cryptocom(instrument) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("cryptocom failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("cryptocom", &e));
+                }
             }
         }
 
         if let Some(ref pair) = config.kraken {
-            if let Ok(p) = fetch_kraken(pair) {
-                prices.push(p);
+            match fetch_kraken(pair) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("kraken failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("kraken", &e));
+                }
             }
         }
 
         if let Some(ref product_id) = config.coinbase {
-            if let Ok(p) = fetch_coinbase(product_id) {
-                prices.push(p);
+            match fetch_coinbase(product_id) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("coinbase failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("coinbase", &e));
+                }
             }
         }
 
         if let Some(ref pair) = config.bitstamp {
-            if let Ok(p) = fetch_bitstamp(pair) {
-                prices.push(p);
+            match fetch_bitstamp(pair) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("bitstamp failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("bitstamp", &e));
+                }
             }
         }
 
         if let Some(ref inst_id) = config.okx {
-            if let Ok(p) = fetch_okx(inst_id) {
-                prices.push(p);
+            match fetch_okx(inst_id) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("okx failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("okx", &e));
+                }
             }
         }
 
         if let Some(ref symbol) = config.bitget {
-            if let Ok(p) = fetch_bitget(symbol) {
-                prices.push(p);
+            match fetch_bitget(symbol) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("bitget failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("bitget", &e));
+                }
             }
         }
 
         if let Some(ref symbol) = config.mexc {
-            if let Ok(p) = fetch_mexc(symbol) {
-                prices.push(p);
+            match fetch_mexc(symbol) {
+                Ok(p) => out.prices.push(p),
+                Err(e) => {
+                    eprintln!("mexc failed: {}", e);
+                    out.failures.push(VenueFailure::from_error("mexc", &e));
+                }
             }
         }
 
-        prices
+        out
     }
 
     // ------------------------------------------------------------------------
@@ -964,8 +1074,9 @@ pub mod sync {
         configs: &HashMap<String, ExchangeConfig>,
         api_key: Option<&str>,
         pyth_api_key: Option<&str>,
-    ) -> HashMap<String, Vec<SourcePrice>> {
-        let mut out: HashMap<String, Vec<SourcePrice>> = configs
+    ) -> FetchOutcome {
+        let mut out = FetchOutcome::default();
+        out.prices = configs
             .keys()
             .map(|token| (token.clone(), Vec::new()))
             .collect();
@@ -978,8 +1089,11 @@ pub mod sync {
         if !coingecko.is_empty() {
             let ids: Vec<&str> = coingecko.keys().copied().collect();
             match fetch_coingecko_batch(&ids, api_key) {
-                Ok(prices) => fan_out(&mut out, &coingecko, &prices, "coingecko", fetched_now),
-                Err(e) => eprintln!("coingecko batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &coingecko, &prices, "coingecko", fetched_now),
+                Err(e) => {
+                    eprintln!("coingecko batch failed: {}", e);
+                    fail_venue(&mut out, &coingecko, VenueFailure::from_error("coingecko", &e));
+                }
             }
         }
 
@@ -987,8 +1101,11 @@ pub mod sync {
         if !binance.is_empty() {
             let symbols: Vec<&str> = binance.keys().copied().collect();
             match fetch_binance_batch(&symbols) {
-                Ok(prices) => fan_out(&mut out, &binance, &prices, "binance", fetched_now),
-                Err(e) => eprintln!("binance batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &binance, &prices, "binance", fetched_now),
+                Err(e) => {
+                    eprintln!("binance batch failed: {}", e);
+                    fail_venue(&mut out, &binance, VenueFailure::from_error("binance", &e));
+                }
             }
         }
 
@@ -996,8 +1113,11 @@ pub mod sync {
         if !binance_us.is_empty() {
             let symbols: Vec<&str> = binance_us.keys().copied().collect();
             match fetch_binance_us_batch(&symbols) {
-                Ok(prices) => fan_out(&mut out, &binance_us, &prices, "binance_us", fetched_now),
-                Err(e) => eprintln!("binance_us batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &binance_us, &prices, "binance_us", fetched_now),
+                Err(e) => {
+                    eprintln!("binance_us batch failed: {}", e);
+                    fail_venue(&mut out, &binance_us, VenueFailure::from_error("binance_us", &e));
+                }
             }
         }
 
@@ -1006,9 +1126,12 @@ pub mod sync {
             let addresses: Vec<&str> = binance_alpha.keys().copied().collect();
             match fetch_binance_alpha_batch(&addresses) {
                 Ok(prices) => {
-                    fan_out(&mut out, &binance_alpha, &prices, "binance_alpha", fetched_now)
+                    fan_out_recording(&mut out, &binance_alpha, &prices, "binance_alpha", fetched_now)
                 }
-                Err(e) => eprintln!("binance_alpha batch failed: {}", e),
+                Err(e) => {
+                    eprintln!("binance_alpha batch failed: {}", e);
+                    fail_venue(&mut out, &binance_alpha, VenueFailure::from_error("binance_alpha", &e));
+                }
             }
         }
 
@@ -1020,17 +1143,27 @@ pub mod sync {
                     match fetch_pyth_batch(&price_ids, key) {
                         // Same per-feed freshness rule as the single-feed path
                         Ok(prices) => {
-                            fan_out(&mut out, &pyth, &prices, "pyth", pyth_publish_time)
+                            fan_out_recording(&mut out, &pyth, &prices, "pyth", pyth_publish_time)
                         }
-                        Err(e) => eprintln!("pyth batch failed: {}", e),
+                        Err(e) => {
+                            eprintln!("pyth batch failed: {}", e);
+                            fail_venue(&mut out, &pyth, VenueFailure::from_error("pyth", &e));
+                        }
                     }
                 }
                 // Not an error: the venue is off until a key is configured
-                None => eprintln!(
-                    "pyth skipped for {} feed(s): {} is not set",
-                    pyth.len(),
-                    PYTH_API_KEY_ENV
-                ),
+                None => {
+                    eprintln!(
+                        "pyth skipped for {} feed(s): {} is not set",
+                        pyth.len(),
+                        PYTH_API_KEY_ENV
+                    );
+                    fail_venue(
+                        &mut out,
+                        &pyth,
+                        VenueFailure::new("pyth", FailureReason::NotConfigured),
+                    );
+                }
             }
         }
 
@@ -1038,8 +1171,11 @@ pub mod sync {
         if !chainlink.is_empty() {
             let feeds: Vec<&str> = chainlink.keys().copied().collect();
             match fetch_chainlink_batch(&feeds) {
-                Ok(prices) => fan_out(&mut out, &chainlink, &prices, "chainlink", fetched_now),
-                Err(e) => eprintln!("chainlink batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &chainlink, &prices, "chainlink", fetched_now),
+                Err(e) => {
+                    eprintln!("chainlink batch failed: {}", e);
+                    fail_venue(&mut out, &chainlink, VenueFailure::from_error("chainlink", &e));
+                }
             }
         }
 
@@ -1047,8 +1183,11 @@ pub mod sync {
         if !huobi.is_empty() {
             let symbols: Vec<&str> = huobi.keys().copied().collect();
             match fetch_huobi_batch(&symbols) {
-                Ok(prices) => fan_out(&mut out, &huobi, &prices, "huobi", fetched_now),
-                Err(e) => eprintln!("huobi batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &huobi, &prices, "huobi", fetched_now),
+                Err(e) => {
+                    eprintln!("huobi batch failed: {}", e);
+                    fail_venue(&mut out, &huobi, VenueFailure::from_error("huobi", &e));
+                }
             }
         }
 
@@ -1056,8 +1195,11 @@ pub mod sync {
         if !kucoin.is_empty() {
             let symbols: Vec<&str> = kucoin.keys().copied().collect();
             match fetch_kucoin_batch(&symbols) {
-                Ok(prices) => fan_out(&mut out, &kucoin, &prices, "kucoin", fetched_now),
-                Err(e) => eprintln!("kucoin batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &kucoin, &prices, "kucoin", fetched_now),
+                Err(e) => {
+                    eprintln!("kucoin batch failed: {}", e);
+                    fail_venue(&mut out, &kucoin, VenueFailure::from_error("kucoin", &e));
+                }
             }
         }
 
@@ -1065,8 +1207,11 @@ pub mod sync {
         if !gate.is_empty() {
             let pairs: Vec<&str> = gate.keys().copied().collect();
             match fetch_gate_batch(&pairs) {
-                Ok(prices) => fan_out(&mut out, &gate, &prices, "gate", fetched_now),
-                Err(e) => eprintln!("gate batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &gate, &prices, "gate", fetched_now),
+                Err(e) => {
+                    eprintln!("gate batch failed: {}", e);
+                    fail_venue(&mut out, &gate, VenueFailure::from_error("gate", &e));
+                }
             }
         }
 
@@ -1074,8 +1219,11 @@ pub mod sync {
         if !cryptocom.is_empty() {
             let instruments: Vec<&str> = cryptocom.keys().copied().collect();
             match fetch_cryptocom_batch(&instruments) {
-                Ok(prices) => fan_out(&mut out, &cryptocom, &prices, "cryptocom", fetched_now),
-                Err(e) => eprintln!("cryptocom batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &cryptocom, &prices, "cryptocom", fetched_now),
+                Err(e) => {
+                    eprintln!("cryptocom batch failed: {}", e);
+                    fail_venue(&mut out, &cryptocom, VenueFailure::from_error("cryptocom", &e));
+                }
             }
         }
 
@@ -1083,8 +1231,11 @@ pub mod sync {
         if !kraken.is_empty() {
             let pairs: Vec<&str> = kraken.keys().copied().collect();
             match fetch_kraken_batch(&pairs) {
-                Ok(prices) => fan_out(&mut out, &kraken, &prices, "kraken", fetched_now),
-                Err(e) => eprintln!("kraken batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &kraken, &prices, "kraken", fetched_now),
+                Err(e) => {
+                    eprintln!("kraken batch failed: {}", e);
+                    fail_venue(&mut out, &kraken, VenueFailure::from_error("kraken", &e));
+                }
             }
         }
 
@@ -1092,8 +1243,11 @@ pub mod sync {
         if !coinbase.is_empty() {
             let product_ids: Vec<&str> = coinbase.keys().copied().collect();
             match fetch_coinbase_batch(&product_ids) {
-                Ok(prices) => fan_out(&mut out, &coinbase, &prices, "coinbase", fetched_now),
-                Err(e) => eprintln!("coinbase batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &coinbase, &prices, "coinbase", fetched_now),
+                Err(e) => {
+                    eprintln!("coinbase batch failed: {}", e);
+                    fail_venue(&mut out, &coinbase, VenueFailure::from_error("coinbase", &e));
+                }
             }
         }
 
@@ -1101,8 +1255,11 @@ pub mod sync {
         if !bitstamp.is_empty() {
             let pairs: Vec<&str> = bitstamp.keys().copied().collect();
             match fetch_bitstamp_batch(&pairs) {
-                Ok(prices) => fan_out(&mut out, &bitstamp, &prices, "bitstamp", fetched_now),
-                Err(e) => eprintln!("bitstamp batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &bitstamp, &prices, "bitstamp", fetched_now),
+                Err(e) => {
+                    eprintln!("bitstamp batch failed: {}", e);
+                    fail_venue(&mut out, &bitstamp, VenueFailure::from_error("bitstamp", &e));
+                }
             }
         }
 
@@ -1110,8 +1267,11 @@ pub mod sync {
         if !okx.is_empty() {
             let inst_ids: Vec<&str> = okx.keys().copied().collect();
             match fetch_okx_batch(&inst_ids) {
-                Ok(prices) => fan_out(&mut out, &okx, &prices, "okx", fetched_now),
-                Err(e) => eprintln!("okx batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &okx, &prices, "okx", fetched_now),
+                Err(e) => {
+                    eprintln!("okx batch failed: {}", e);
+                    fail_venue(&mut out, &okx, VenueFailure::from_error("okx", &e));
+                }
             }
         }
 
@@ -1119,8 +1279,11 @@ pub mod sync {
         if !bitget.is_empty() {
             let symbols: Vec<&str> = bitget.keys().copied().collect();
             match fetch_bitget_batch(&symbols) {
-                Ok(prices) => fan_out(&mut out, &bitget, &prices, "bitget", fetched_now),
-                Err(e) => eprintln!("bitget batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &bitget, &prices, "bitget", fetched_now),
+                Err(e) => {
+                    eprintln!("bitget batch failed: {}", e);
+                    fail_venue(&mut out, &bitget, VenueFailure::from_error("bitget", &e));
+                }
             }
         }
 
@@ -1128,8 +1291,11 @@ pub mod sync {
         if !mexc.is_empty() {
             let symbols: Vec<&str> = mexc.keys().copied().collect();
             match fetch_mexc_batch(&symbols) {
-                Ok(prices) => fan_out(&mut out, &mexc, &prices, "mexc", fetched_now),
-                Err(e) => eprintln!("mexc batch failed: {}", e),
+                Ok(prices) => fan_out_recording(&mut out, &mexc, &prices, "mexc", fetched_now),
+                Err(e) => {
+                    eprintln!("mexc batch failed: {}", e);
+                    fail_venue(&mut out, &mexc, VenueFailure::from_error("mexc", &e));
+                }
             }
         }
 
@@ -1139,6 +1305,42 @@ pub mod sync {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A venue that answered the batch without an asset's symbol failed that asset alone;
+        /// an entry the timestamp rule drops is a stale upstream; a venue whose whole batch
+        /// failed fails every asset that asked it. The prices themselves fan out as before.
+        #[test]
+        fn fan_out_records_what_each_venue_did_not_price() {
+            let configs: HashMap<String, ExchangeConfig> = [
+                ("near", ExchangeConfig { okx: Some("NEAR-USDT".into()), ..Default::default() }),
+                ("eth", ExchangeConfig { okx: Some("ETH-USDT".into()), ..Default::default() }),
+                ("old", ExchangeConfig { okx: Some("OLD-USDT".into()), ..Default::default() }),
+            ]
+            .into_iter()
+            .map(|(t, c)| (t.to_string(), c))
+            .collect();
+            let index = index_symbols(&configs, |c| c.okx.as_deref());
+
+            let mut answered: parsers::BatchPrices = HashMap::new();
+            answered.insert("NEAR-USDT".into(), parsers::BatchPrice { price: 3.0, timestamp: Some(100) });
+            answered.insert("OLD-USDT".into(), parsers::BatchPrice { price: 1.0, timestamp: None });
+
+            let mut out = FetchOutcome::default();
+            out.prices = configs.keys().map(|t| (t.clone(), Vec::new())).collect();
+            // the rule: an entry without a timestamp is dropped
+            fan_out_recording(&mut out, &index, &answered, "okx", |_, entry| entry.timestamp);
+
+            assert_eq!(out.prices_of("near").len(), 1);
+            assert!(out.failures_of("near").is_empty());
+            assert_eq!(out.failures_of("eth"), &[VenueFailure::new("okx", FailureReason::PairMissing)]);
+            assert_eq!(out.failures_of("old"), &[VenueFailure::new("okx", FailureReason::StaleUpstream)]);
+            assert!(out.prices_of("old").is_empty());
+
+            fail_venue(&mut out, &index, VenueFailure::from_error("okx", &anyhow::anyhow!("HTTP 429")));
+            for token in ["near", "eth", "old"] {
+                assert!(out.failures_of(token).iter().any(|f| f.reason == FailureReason::RateLimited), "{token}");
+            }
+        }
 
         fn custom(url: &str) -> CustomSourceConfig {
             CustomSourceConfig {

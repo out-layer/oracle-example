@@ -533,6 +533,21 @@ Result: No human holds the signing key. Only verified TEE code can push prices.`
                       <td className="py-2 px-3">1</td>
                       <td className="py-2 px-3">Minimum venues that must be inside your window for an asset to be priced. The default of <code>1</code> is a floor, not a recommendation — a lending market should raise it, so a narrow window can never be answered by a single venue</td>
                     </tr>
+                    <tr className="border-b border-dark-800">
+                      <td className="py-2 px-3"><code className="text-primary">skip_failed_sources</code></td>
+                      <td className="py-2 px-3">false</td>
+                      <td className="py-2 px-3">A venue whose most recent refresh attempt failed does not vote, as long as the venues left inside your window still satisfy <code>min_sources_num</code>. Otherwise it votes as usual, so a single-venue asset stays priced while its venue is down. See <a href="#publish-time" className="text-primary hover:underline">what publish_time is</a></td>
+                    </tr>
+                    <tr className="border-b border-dark-800">
+                      <td className="py-2 px-3"><code className="text-primary">allow_partial</code></td>
+                      <td className="py-2 px-3">false</td>
+                      <td className="py-2 px-3">An asset that cannot be priced is left out of the signed payload and listed under <code>skipped</code> with a reason, instead of failing the request. No asset priced at all is still an error</td>
+                    </tr>
+                    <tr className="border-b border-dark-800">
+                      <td className="py-2 px-3"><code className="text-primary">report_sources</code></td>
+                      <td className="py-2 px-3">false</td>
+                      <td className="py-2 px-3">Every configured venue per asset, with what it did for this answer, under <code>sources</code> — see <a href="#source-report" className="text-primary hover:underline">the source report</a></td>
+                    </tr>
                   </tbody>
                 </table>
               </div>
@@ -546,7 +561,9 @@ Result: No human holds the signing key. Only verified TEE code can push prices.`
   "signature": "YC2Nd2IyViEp7JKIDqkehHT9bnn2qTJl8iP0frNrlK63NJTjNO0LbI8u28qmH66+mEP2IIi+NrC4oIkXxk/uBw==",
   "public_key": "ed25519:FU6EnB4UaAiDCAxvQPkRUu5QQExgzvKQAX891wMEX3rU",
   "sig_format": "json",
-  "error": null
+  "error": null,
+  "skipped": null,
+  "sources": null
 }`}</code>
                 </pre>
                 <p className="text-dark-400 text-sm mt-3">
@@ -757,6 +774,23 @@ repeated per entry:
                     its age can make it wrong, and the age bound is your check.
                   </li>
                   <li>
+                    <strong className="text-white">The stamp can also stay while the price moves.</strong> A venue
+                    whose fetch fails keeps its last observation in the record, and that observation keeps voting while
+                    it is inside your window. Being the oldest, it holds{' '}
+                    <code className="text-primary">publish_time</code> while the price moves with the venues that did
+                    refresh. Every such payload is genuine and no older than its stamp says. The stamp bounds
+                    staleness; it does not identify an observation, so two different prices can share it.
+                  </li>
+                  <li>
+                    <strong className="text-white"><code className="text-primary">skip_failed_sources</code> lifts
+                    that.</strong> The record remembers which venues failed their most recent attempt. With the flag,
+                    such a venue does not vote while enough healthy venues remain inside your window, and{' '}
+                    <code className="text-primary">publish_time</code> follows the venues that are actually answering.
+                    When the healthy set is thinner than <code className="text-primary">min_sources_num</code>, the
+                    failed venue votes after all: an asset with a single venue stays priced, honestly stamped, rather
+                    than failing.
+                  </li>
+                  <li>
                     <strong className="text-white">Assets in one response may carry different stamps.</strong> A
                     refresh writes the assets one at a time over a few seconds, so a request that lands during a
                     refresh sees the new stamp on the assets already written and the previous one on the rest. Each is
@@ -767,14 +801,100 @@ repeated per entry:
                     <code className="text-primary">publish_time</code> equals the one you last submitted before sending
                     the transaction, and have the contract skip, not fail, a stamp that is not strictly newer — as the
                     receiver above does. A hard monotonic check turns every repeated poll into a rejected transaction.
+                    Keep skipping when the price differs: payloads that share a stamp carry no order, and a contract
+                    that accepts equal stamps lets whoever holds several of them switch the stored price between them.
                   </li>
                   <li>
                     <strong className="text-white">Need fresher observations than the cache gives you?</strong> Narrow{' '}
-                    <code className="text-primary">max_age_secs</code>. When the cache cannot satisfy the window the
-                    enclave fetches live from the allowed venues inside the call, at a few seconds of latency per
-                    request. The window is the guarantee; a refresh every N seconds is not.
+                    <code className="text-primary">max_age_secs</code>. A venue that stopped refreshing then leaves
+                    your window sooner and stops holding <code className="text-primary">publish_time</code>. When the
+                    cache cannot satisfy the window the enclave fetches live from the allowed venues inside the call,
+                    at a few seconds of latency per request. The window is the guarantee; a refresh every N seconds is
+                    not.
+                  </li>
+                  <li>
+                    <strong className="text-white">One unpriced asset fails the whole request.</strong> A signed feed
+                    is never partial. An asset with a single venue cannot be priced while that venue is outside your
+                    window and a live fetch fails too, and then nothing is signed. The narrower the window, the more
+                    often that happens; request such an asset separately if the rest must not depend on it.
                   </li>
                 </ul>
+              </div>
+
+              <h3 id="source-report" className="text-lg font-semibold text-white mb-4">
+                Partial answers and the source report
+              </h3>
+              <div className="card mb-6">
+                <p className="text-dark-300 mb-4">
+                  With <code className="text-primary">allow_partial</code>, an asset the gate refuses is left out of{' '}
+                  <code className="text-primary">payload</code> and named under{' '}
+                  <code className="text-primary">skipped</code>; the rest are signed as usual. A consumer that never
+                  reads <code className="text-primary">skipped</code> sees an absent key, never a wrong number. With{' '}
+                  <code className="text-primary">report_sources</code>, every configured venue of every requested
+                  asset is listed under <code className="text-primary">sources</code>. Both sit outside the signature
+                  and inside the call&apos;s <code className="text-primary">output</code>, so the call&apos;s
+                  attestation covers them and its <code className="text-primary">call_id</code> links them.
+                </p>
+                <pre className="bg-dark-950 rounded-lg p-4 overflow-x-auto text-sm mb-4">
+                  <code className="text-dark-200">{`{
+  "success": true,
+  "payload": "{\\"wrap.near\\":{\\"price\\":\\"530785000\\",\\"expo\\":-8,\\"publish_time\\":1791633584}}",
+  "signature": "…",
+  "public_key": "ed25519:FU6EnB4UaAiDCAxvQPkRUu5QQExgzvKQAX891wMEX3rU",
+  "sig_format": "json",
+  "error": null,
+  "skipped": [
+    { "asset_id": "853d955a…factory.bridge.near", "reason": "price_too_old", "age_secs": 75 }
+  ],
+  "sources": {
+    "wrap.near": [
+      { "name": "coingecko", "status": "skipped_failed", "observed_at": 1791633468, "age_secs": 58,
+        "failed_at": 1791633481, "reason": "rate_limited", "http_status": 429 },
+      { "name": "pyth", "status": "excluded" },
+      { "name": "chainlink", "status": "outside_window", "observed_at": 1791633380, "age_secs": 146 },
+      { "name": "okx", "status": "used", "observed_at": 1791633584, "age_secs": 6 }
+    ],
+    "853d955a…factory.bridge.near": [
+      { "name": "coingecko", "status": "outside_window", "observed_at": 1791633468, "age_secs": 75,
+        "failed_at": 1791633481, "reason": "rate_limited", "http_status": 429 },
+      { "name": "chainlink", "status": "excluded" }
+    ]
+  }
+}`}</code>
+                </pre>
+                <div className="overflow-x-auto mb-4">
+                  <table className="w-full text-sm text-dark-300">
+                    <thead>
+                      <tr className="border-b border-dark-700 text-left">
+                        <th className="py-2 px-3"><code className="text-primary">status</code></th>
+                        <th className="py-2 px-3">Meaning</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr className="border-b border-dark-800"><td className="py-2 px-3"><code>used</code></td><td className="py-2 px-3">Inside your window; voted</td></tr>
+                      <tr className="border-b border-dark-800"><td className="py-2 px-3"><code>skipped_failed</code></td><td className="py-2 px-3">Inside your window, but its most recent attempt failed and you passed <code>skip_failed_sources</code></td></tr>
+                      <tr className="border-b border-dark-800"><td className="py-2 px-3"><code>failed</code></td><td className="py-2 px-3">Attempted during this very call (a live fetch) and produced no price</td></tr>
+                      <tr className="border-b border-dark-800"><td className="py-2 px-3"><code>outside_window</code></td><td className="py-2 px-3">Has an observation, older than your window</td></tr>
+                      <tr className="border-b border-dark-800"><td className="py-2 px-3"><code>excluded</code></td><td className="py-2 px-3">Left out by your <code>exclude_sources</code></td></tr>
+                      <tr className="border-b border-dark-800"><td className="py-2 px-3"><code>unused</code></td><td className="py-2 px-3">Inside your window, yet no answer was built from the record: the asset failed</td></tr>
+                      <tr className="border-b border-dark-800"><td className="py-2 px-3"><code>missing</code></td><td className="py-2 px-3">Configured, but no observation is held for it</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-dark-400 text-sm">
+                  <code className="text-primary">failed_at</code>, <code className="text-primary">reason</code> and{' '}
+                  <code className="text-primary">http_status</code> are present whenever the venue&apos;s most recent
+                  attempt failed, whatever its status: a venue can vote on a retained observation and still be known to
+                  have failed since. <code className="text-primary">reason</code> is a closed set —{' '}
+                  <code>timeout</code>, <code>connect_failed</code>, <code>rate_limited</code>, <code>http_error</code>,{' '}
+                  <code>bad_response</code>, <code>pair_missing</code>, <code>stale_upstream</code>,{' '}
+                  <code>not_configured</code>, <code>other</code> — and never the venue&apos;s error text. The failure
+                  usually belongs to the scheduler&apos;s last refresh, not to your call;{' '}
+                  <code className="text-primary">failed_at</code> says when.{' '}
+                  <code className="text-primary">skipped[].reason</code> is one of <code>unknown_asset</code>,{' '}
+                  <code>not_enough_sources</code>, <code>price_too_old</code> (with <code>age_secs</code>),{' '}
+                  <code>fetch_failed</code>, <code>no_price</code>.
+                </p>
               </div>
 
               <h3 className="text-lg font-semibold text-white mb-4">Running it in production</h3>

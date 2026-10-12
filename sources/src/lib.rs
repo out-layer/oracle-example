@@ -32,6 +32,146 @@ pub struct SourcePrice {
     pub timestamp: u64,
 }
 
+/// Why a venue produced no price in one fetch attempt.
+///
+/// A closed set on purpose. The reason travels to callers and into attested output, and the
+/// raw error behind it may quote the request URL — which for CoinGecko carries the API key as
+/// a query parameter. The text stays on stderr; only the code leaves the enclave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    /// The connection or the read exceeded its deadline
+    Timeout,
+    /// No connection could be established (DNS, refused, reset)
+    ConnectFailed,
+    /// HTTP 429
+    RateLimited,
+    /// Any other non-success HTTP status; the code is in `VenueFailure::status`
+    HttpError,
+    /// The venue answered, but not with something the parser accepts
+    BadResponse,
+    /// The venue answered the batch, but the asset's symbol was not in it
+    PairMissing,
+    /// The venue answered with data older than it allows itself (Pyth's own `publish_time`)
+    StaleUpstream,
+    /// The venue needs a credential the worker does not hold, so it was not requested
+    NotConfigured,
+    /// Nothing above matched
+    Other,
+}
+
+impl FailureReason {
+    /// Classify a fetch error by the text the fetchers produce.
+    ///
+    /// The fetchers report transport and HTTP failures as `anyhow` strings in a handful of
+    /// fixed shapes (`HTTP 429`, `… timed out`, `… parse error: …`), so a lookup over those
+    /// shapes is what turns them into a code. Anything unrecognised is `Other`, never the text.
+    pub fn classify(error: &anyhow::Error) -> (FailureReason, Option<u16>) {
+        let text = format!("{:#}", error).to_ascii_lowercase();
+        if let Some(status) = http_status_in(&text) {
+            return if status == 429 {
+                (FailureReason::RateLimited, Some(status))
+            } else {
+                (FailureReason::HttpError, Some(status))
+            };
+        }
+        if text.contains("timed out") || text.contains("timeout") {
+            return (FailureReason::Timeout, None);
+        }
+        if text.contains("connect")
+            || text.contains("dns")
+            || text.contains("resolve")
+            || text.contains("connection")
+        {
+            return (FailureReason::ConnectFailed, None);
+        }
+        if text.contains("parse")
+            || text.contains("returned code")
+            || text.contains("returned status")
+            || text.contains("api error")
+            || text.contains("not found")
+            || text.contains("missing")
+            || text.contains("unavailable")
+        {
+            return (FailureReason::BadResponse, None);
+        }
+        (FailureReason::Other, None)
+    }
+}
+
+/// The status code in an `HTTP <code>` fragment, if the text has one
+fn http_status_in(text: &str) -> Option<u16> {
+    let at = text.find("http ")?;
+    let digits: String = text[at + 5..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok().filter(|s| (100..1000).contains(s))
+}
+
+/// One venue that produced no price for one asset in a fetch attempt
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VenueFailure {
+    pub source: String,
+    pub reason: FailureReason,
+    /// HTTP status for `RateLimited` and `HttpError`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+}
+
+impl VenueFailure {
+    pub fn from_error(source: &str, error: &anyhow::Error) -> Self {
+        let (reason, status) = FailureReason::classify(error);
+        VenueFailure {
+            source: source.to_string(),
+            reason,
+            status,
+        }
+    }
+
+    pub fn new(source: &str, reason: FailureReason) -> Self {
+        VenueFailure {
+            source: source.to_string(),
+            reason,
+            status: None,
+        }
+    }
+}
+
+/// What one fetch produced: the prices it observed and the venues it tried that gave none.
+///
+/// Both are keyed by asset. A venue absent from both for an asset was not attempted — that
+/// is how a tiered refresh looks, and the caller must not mark such venues as failed.
+#[derive(Debug, Clone, Default)]
+pub struct FetchOutcome {
+    pub prices: std::collections::HashMap<String, Vec<SourcePrice>>,
+    pub failures: std::collections::HashMap<String, Vec<VenueFailure>>,
+}
+
+impl FetchOutcome {
+    pub fn fail(&mut self, token: &str, failure: VenueFailure) {
+        self.failures
+            .entry(token.to_string())
+            .or_default()
+            .push(failure);
+    }
+
+    pub fn prices_of(&self, token: &str) -> &[SourcePrice] {
+        self.prices.get(token).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    pub fn failures_of(&self, token: &str) -> &[VenueFailure] {
+        self.failures.get(token).map(Vec::as_slice).unwrap_or_default()
+    }
+}
+
+/// What a single-asset fetch produced
+#[derive(Debug, Clone, Default)]
+pub struct SingleFetch {
+    pub prices: Vec<SourcePrice>,
+    pub failures: Vec<VenueFailure>,
+}
+
 /// Per-asset exchange configuration.
 /// Stored as opaque JSON in the oracle contract, parsed by WASI/scheduler.
 /// Unknown fields are silently ignored (allows adding new exchanges without code changes).
@@ -224,5 +364,50 @@ pub struct HttpResponse {
 impl HttpResponse {
     pub fn json<T: for<'de> Deserialize<'de>>(&self) -> anyhow::Result<T> {
         Ok(serde_json::from_slice(&self.body)?)
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    /// A fetch error leaves the enclave as a code. The text is where a URL would be quoted,
+    /// and the CoinGecko URL carries the API key, so the text itself must never serialize.
+    #[test]
+    fn errors_become_codes_and_never_text() {
+        let cases = [
+            ("HTTP 429", FailureReason::RateLimited, Some(429)),
+            ("HTTP 503", FailureReason::HttpError, Some(503)),
+            ("https://x/api?x_cg_pro_api_key=CG-secret: HTTP 403", FailureReason::HttpError, Some(403)),
+            ("request timed out after 3s", FailureReason::Timeout, None),
+            ("connection refused", FailureReason::ConnectFailed, None),
+            ("CoinGecko batch response parse error: expected value", FailureReason::BadResponse, None),
+            ("KuCoin batch returned code '200001'", FailureReason::BadResponse, None),
+            ("Kraken batch API error: EQuery:Unknown asset pair", FailureReason::BadResponse, None),
+            ("something nobody foresaw", FailureReason::Other, None),
+        ];
+        for (text, reason, status) in cases {
+            assert_eq!(
+                FailureReason::classify(&anyhow::anyhow!(text)),
+                (reason, status),
+                "{text}"
+            );
+        }
+
+        let failure = VenueFailure::from_error(
+            "coingecko",
+            &anyhow::anyhow!(
+                "https://pro-api.coingecko.com/api/v3/simple/price?ids=near&x_cg_pro_api_key=CG-secret-123: HTTP 401"
+            ),
+        );
+        let json = serde_json::to_string(&failure).unwrap();
+        assert!(!json.contains("secret"), "{json}");
+        assert_eq!(json, r#"{"source":"coingecko","reason":"http_error","status":401}"#);
+
+        // a status outside the HTTP range is not a status
+        assert_eq!(
+            FailureReason::classify(&anyhow::anyhow!("http 99999 nonsense")),
+            (FailureReason::Other, None)
+        );
     }
 }

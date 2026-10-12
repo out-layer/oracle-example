@@ -560,6 +560,9 @@ mod tests {
                 exclude_sources,
                 aggregation_method,
                 min_sources_num,
+                skip_failed_sources,
+                allow_partial,
+                report_sources,
             } => {
                 assert_eq!(tokens, vec!["wrap.near", "eth.bridge.near"]);
                 assert_eq!(max_age_secs, 60);
@@ -567,6 +570,10 @@ mod tests {
                 assert_eq!(sig_format, None);
                 assert_eq!(expo, None);
                 assert_eq!(exclude_sources, Some(vec!["pyth".to_string()]));
+                // a request written before these options existed asks for none of them
+                assert!(!skip_failed_sources);
+                assert!(!allow_partial);
+                assert!(!report_sources);
                 assert_eq!(aggregation_method, AggregationMethod::Median);
                 assert_eq!(min_sources_num, 1);
             }

@@ -452,6 +452,9 @@ curl -sX POST https://api.outlayer.ai/call/price-oracle.near/price-oracle \
 | `sig_format` | `json` | `json` or `borsh` |
 | `expo` | -8 | `price` is an integer scaled by `10^expo` |
 | `min_sources_num` | 1 | Minimum venues inside the window for an asset to be priced |
+| `skip_failed_sources` | false | A venue whose most recent refresh attempt failed does not vote, as long as the venues left inside the window still satisfy `min_sources_num`. Otherwise it votes as usual, so a single-venue asset stays priced while its venue is down |
+| `allow_partial` | false | An asset that cannot be priced is left out of the signed payload and listed under `skipped` with a reason, instead of failing the request. No asset priced at all is still an error |
+| `report_sources` | false | Every configured venue per asset, with what it did for this answer, under `sources` |
 
 `secrets_ref` is mandatory and always this value: it is what puts the signing key in the enclave.
 
@@ -466,7 +469,9 @@ The `output` of the call envelope:
   "signature": "<base64 of the 64-byte Ed25519 signature>",
   "public_key": "ed25519:FU6EnB4UaAiDCAxvQPkRUu5QQExgzvKQAX891wMEX3rU",
   "sig_format": "json",
-  "error": null
+  "error": null,
+  "skipped": null,
+  "sources": null
 }
 ```
 
@@ -486,16 +491,89 @@ decimal string. The public key is pinned; a changed key is a failure, not an upd
 - **Two polls inside one cycle return the same signed price with the same `publish_time`.**
   Nothing was observed in between, and the value is still inside the window you asked for.
   Treat it as "no new data". Only its age can make it wrong, and the age bound is your check.
+- **The stamp can also stay while the price moves.** A venue whose fetch fails keeps its last
+  observation in the record, and that observation keeps voting while it is inside your window.
+  Being the oldest, it holds `publish_time` while the price moves with the venues that did
+  refresh. Every such payload is genuine and no older than its stamp says. The stamp bounds
+  staleness; it does not identify an observation, so two different prices can share it.
+- **`skip_failed_sources` lifts that.** The record remembers which venues failed their most
+  recent attempt. With the flag, such a venue does not vote while enough healthy venues
+  remain inside your window, and `publish_time` follows the venues that are actually
+  answering. When the healthy set is thinner than `min_sources_num`, the failed venue votes
+  after all: an asset with a single venue stays priced, honestly stamped, rather than failing.
 - **Assets in one response may carry different stamps.** A refresh writes the assets one at a
   time over a few seconds, so a request that lands during a refresh sees the new stamp on the
   assets already written and the previous one on the rest. Each is inside your window and
   signed with its own stamp.
 - **Pushing on-chain:** drop every asset whose `publish_time` equals the one you last
   submitted, and have the contract skip, not fail, a stamp that is not strictly newer. A hard
-  monotonic check turns every repeated poll into a rejected transaction.
-- **Fresher than the cache:** narrow `max_age_secs`. When the cache cannot satisfy the window
-  the enclave fetches live from the allowed venues inside the call, at a few seconds of latency.
-  The window is the guarantee; a refresh every N seconds is not.
+  monotonic check turns every repeated poll into a rejected transaction. Keep skipping when the
+  price differs: payloads that share a stamp carry no order, and a contract that accepts equal
+  stamps lets whoever holds several of them switch the stored price between them.
+- **Fresher than the cache:** narrow `max_age_secs`. A venue that stopped refreshing then
+  leaves your window sooner and stops holding `publish_time`. When the cache cannot satisfy the
+  window the enclave fetches live from the allowed venues inside the call, at a few seconds of
+  latency. The window is the guarantee; a refresh every N seconds is not.
+- **One unpriced asset fails the whole request.** A signed feed is never partial. An asset
+  with a single venue cannot be priced while that venue is outside your window and a live
+  fetch fails too, and then nothing is signed. The narrower the window, the more often that
+  happens; request such an asset separately if the rest must not depend on it.
+
+### Partial answers and the source report
+
+With `allow_partial`, an asset the gate refuses is left out of `payload` and named under
+`skipped`; the rest are signed as usual. A consumer that never reads `skipped` sees an absent
+key, never a wrong number. With `report_sources`, every configured venue of every requested
+asset is listed under `sources`. Both sit outside the signature and inside the call's
+`output`, so the call's attestation covers them and its `call_id` links them.
+
+```json
+{
+  "success": true,
+  "payload": "{\"wrap.near\":{\"price\":\"530785000\",\"expo\":-8,\"publish_time\":1791633584}}",
+  "signature": "…",
+  "public_key": "ed25519:FU6EnB4UaAiDCAxvQPkRUu5QQExgzvKQAX891wMEX3rU",
+  "sig_format": "json",
+  "error": null,
+  "skipped": [
+    { "asset_id": "853d955acef822db058eb8505911ed77f175b99e.factory.bridge.near", "reason": "price_too_old", "age_secs": 75 }
+  ],
+  "sources": {
+    "wrap.near": [
+      { "name": "coingecko", "status": "skipped_failed", "observed_at": 1791633468, "age_secs": 58,
+        "failed_at": 1791633481, "reason": "rate_limited", "http_status": 429 },
+      { "name": "pyth", "status": "excluded" },
+      { "name": "chainlink", "status": "outside_window", "observed_at": 1791633380, "age_secs": 146 },
+      { "name": "okx", "status": "used", "observed_at": 1791633584, "age_secs": 6 }
+    ],
+    "853d955acef822db058eb8505911ed77f175b99e.factory.bridge.near": [
+      { "name": "coingecko", "status": "outside_window", "observed_at": 1791633468, "age_secs": 75,
+        "failed_at": 1791633481, "reason": "rate_limited", "http_status": 429 },
+      { "name": "chainlink", "status": "excluded" }
+    ]
+  }
+}
+```
+
+| `status` | Meaning |
+|----------|---------|
+| `used` | Inside your window; voted |
+| `skipped_failed` | Inside your window, but its most recent attempt failed and you passed `skip_failed_sources` |
+| `failed` | Attempted during this very call (a live fetch) and produced no price |
+| `outside_window` | Has an observation, older than your window |
+| `excluded` | Left out by your `exclude_sources` |
+| `unused` | Inside your window, yet no answer was built from the record: the asset failed |
+| `missing` | Configured, but no observation is held for it |
+
+`failed_at`, `reason` and `http_status` are present whenever the venue's most recent attempt
+failed, whatever its status: a venue can vote on a retained observation and still be known to
+have failed since. `reason` is a closed set — `timeout`, `connect_failed`, `rate_limited`,
+`http_error`, `bad_response`, `pair_missing`, `stale_upstream`, `not_configured`, `other` —
+and never the venue's error text. The failure usually belongs to the scheduler's last
+refresh, not to your call; `failed_at` says when.
+
+`skipped[].reason` is one of `unknown_asset`, `not_enough_sources`, `price_too_old` (with
+`age_secs`), `fetch_failed`, `no_price`.
 
 ### Checks a consumer owns
 

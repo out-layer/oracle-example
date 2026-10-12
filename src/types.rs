@@ -1,4 +1,6 @@
+use oracle_example_sources::FailureReason;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // Default max age for cached prices (2 minutes)
 pub const DEFAULT_MAX_AGE_SECS: u64 = 120;
@@ -148,6 +150,22 @@ pub enum OracleCommand {
         /// Minimum number of sources required (default: 1)
         #[serde(default = "default_min_sources")]
         min_sources_num: u8,
+        /// A venue whose most recent refresh attempt failed does not vote, as long as the
+        /// venues left inside the window still satisfy `min_sources_num`. Otherwise it votes
+        /// as usual, so an asset with a single venue stays priced while that venue is down.
+        /// Off by default: the stamp then stays the oldest venue inside the window, failed
+        /// or not.
+        #[serde(default)]
+        skip_failed_sources: bool,
+        /// An asset that cannot be priced is left out of the signed payload and listed under
+        /// `skipped` with a reason, instead of failing the whole request. No asset priced at
+        /// all is still an error. Off by default: the feed is then all-or-nothing.
+        #[serde(default)]
+        allow_partial: bool,
+        /// Report every configured venue per asset — used, skipped, failed, outside the
+        /// window, excluded or missing — under `sources`, outside the signed payload.
+        #[serde(default)]
+        report_sources: bool,
     },
 
     /// Force update prices - anyone can call if they pay for execution
@@ -275,6 +293,78 @@ pub struct PriceResult {
     pub from_cache: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Every configured venue and what it did for this answer; only built when a caller
+    /// asked for it (`report_sources`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_report: Option<Vec<SourceReport>>,
+}
+
+/// What one configured venue did for one asset in one answer
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceReport {
+    pub name: String,
+    pub status: SourceStatus,
+    /// When the venue was last observed (seconds); absent when it never was
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<u64>,
+    /// Age of that observation at the moment the answer was built
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<u64>,
+    /// When the venue's most recent attempt failed, if it did
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<FailureReason>,
+    /// HTTP status behind `rate_limited` / `http_error`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+/// Whether a venue took part in an answer, and if not, why
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStatus {
+    /// Its observation is inside the window and voted
+    Used,
+    /// Inside the window, but its last attempt failed and the caller asked to skip such venues
+    SkippedFailed,
+    /// Inside the window, yet no answer was built from this record: the asset failed
+    Unused,
+    /// Attempted in this very call and produced no price
+    Failed,
+    /// Has an observation, older than the caller's window
+    OutsideWindow,
+    /// Left out by the caller's `exclude_sources`
+    Excluded,
+    /// Configured, but no observation is held for it
+    Missing,
+}
+
+/// An asset left out of a partial signed answer
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkippedAsset {
+    pub asset_id: String,
+    pub reason: SkipReason,
+    /// For `price_too_old`: how old the best available price was
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<u64>,
+}
+
+/// Why an asset was left out of a partial signed answer
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// Not an asset this oracle prices
+    UnknownAsset,
+    /// Fewer venues inside the window than `min_sources_num`, and no live fetch could help
+    NotEnoughSources,
+    /// The only price available is older than the caller's window
+    PriceTooOld,
+    /// The cache could not serve the window, and the refetch it triggered failed; whatever
+    /// fallback existed is one the caller's own rules refuse
+    FetchFailed,
+    /// No price at all, for any other reason
+    NoPrice,
 }
 
 /// Custom source configuration
@@ -378,6 +468,11 @@ pub struct SignedPricesResponse {
     /// Payload format actually used ("json" or "borsh")
     pub sig_format: String,
     pub error: Option<String>,
+    /// Assets left out of the payload; a list only when the caller passed `allow_partial`
+    pub skipped: Option<Vec<SkippedAsset>>,
+    /// Per-asset venue report; a map only when the caller passed `report_sources`.
+    /// Outside the signature, inside the attested output.
+    pub sources: Option<BTreeMap<String, Vec<SourceReport>>>,
 }
 
 /// Response for get_public_key command
