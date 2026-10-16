@@ -219,7 +219,8 @@ Upload the new WASM that reads config from storage instead of compiled `tokens.j
 ```bash
 cd oracle-example
 cargo build --target wasm32-wasip2 --release
-# Upload to FastFS / OutLayer project
+outlayer upload target/wasm32-wasip2/release/oracle-example.wasm
+outlayer deploy price-oracle <FastFS URL printed by upload>   # as price-oracle.near
 ```
 
 ## 4. Sync configs to WASI public storage

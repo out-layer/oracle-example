@@ -121,7 +121,7 @@ Setting `UPDATE_CONTRACT_ENABLED=true` also **requires** `ORACLE_CONTRACT_ID` pl
 ### How the secrets are bound
 
 The scheduler calls `POST /call/{PROJECT_OWNER}/{PROJECT_NAME}`, so OutLayer resolves the code
-through the **project**, not through a GitHub URL. Secrets follow the same path: the worker builds a
+through the **project**. Secrets follow the same path: the worker builds a
 `Project { project_id }` accessor from the project the call was made against and asks the keystore
 for that profile.
 
@@ -134,14 +134,9 @@ SECRETS_PROFILE=oracle
 SECRETS_ACCOUNT_ID=price-oracle.near
 ```
 
-Two consequences worth knowing:
-
-- **Renaming, forking or moving the GitHub repository does not invalidate these secrets.** Nothing in
-  the lookup is a repo string. Only `request_execution` calls that declare a `GitHub` code source
-  bind secrets to `github.com/owner/repo`, and those break when the repo is renamed.
-- The profile name is not `default` here. `SECRETS_PROFILE` selects a named profile under
-  `SECRETS_ACCOUNT_ID`, and *all* secrets in that profile are injected into the WASI environment, so
-  a wrong profile name fails as "missing `PROTECTED_` key" rather than as an access error.
+The profile name is not `default` here. `SECRETS_PROFILE` selects a named profile under
+`SECRETS_ACCOUNT_ID`, and *all* secrets in that profile are injected into the WASI environment, so
+a wrong profile name fails as "missing `PROTECTED_` key" rather than as an access error.
 
 `SECRETS_PROFILE`/`SECRETS_ACCOUNT_ID` name a profile and an account. Neither is itself a secret —
 the secret values live encrypted on-chain and are only ever decrypted inside the TEE.

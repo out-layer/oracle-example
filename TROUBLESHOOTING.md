@@ -228,11 +228,13 @@ To discard an uploaded blob without deploying, call `remove_pending_upgrade_code
 
 ## WASI Execution Issues
 
-### WASI binary compilation fails
+### WASI binary not found or out of date
 
-**Symptoms:** First execution takes too long or fails with compilation error.
+**Symptoms:** Execution fails before the WASM runs, or runs an older build.
 
-**Fix:** Use `ExecutionSource::Project` instead of GitHub source to skip compilation, via a council proposal:
+**Fix:** The oracle runs the active version of the project its `code_source` names. Publish the build
+(`outlayer upload target/wasm32-wasip2/release/oracle-example.wasm`, then
+`outlayer deploy price-oracle <FastFS URL>`), and if `code_source` points elsewhere, set it via a council proposal:
 ```bash
 near call price-oracle.testnet create_proposal '{
   "action": {
@@ -245,10 +247,8 @@ near call price-oracle.testnet create_proposal '{
 }' --accountId COUNCIL_MEMBER --deposit 0.1 --networkId testnet
 ```
 
-Or upload WASM to FastFS/IPFS and use `WasmUrl`:
-```bash
-python3 scripts/upload_wasm_fastfs.py target/wasm32-wasip2/release/oracle-example.wasm
-```
+Or pin one published build with
+`{"WasmUrl": {"url": "https://main.fastfs.io/<you>/outlayer.near/<sha256>.wasm", "hash": "<sha256>", "build_target": "wasm32-wasip2"}}`.
 
 ### WASI returns empty prices
 
@@ -359,7 +359,6 @@ near call price-oracle-wrapper.testnet predict \
 
 - Increase `UPDATE_INTERVAL_SECS` (e.g., 120 for low-demand tokens)
 - Increase `PRICE_DIFF_THRESHOLD_PERCENT` (e.g., 2.0)
-- Use `ExecutionSource::Project` to skip compilation
 
 ### Reduce latency for DeFi
 

@@ -241,9 +241,14 @@ cd oracle-example
 
 ### 9.2 Create OutLayer project
 
-1. Go to https://app.outlayer.ai
-2. Create project: name `oracle-example`, link your GitHub repo
-3. Note your project UUID
+```bash
+outlayer upload target/wasm32-wasip2/release/oracle-example.wasm
+# prints SHA256 and: FastFS URL: https://main.fastfs.io/<you>/outlayer.near/<sha256>.wasm
+outlayer deploy oracle-example <FastFS URL>
+```
+
+Or on https://app.outlayer.ai: **Projects** → **Create Project** with the WASM URL and its SHA256.
+Note your project UUID.
 
 ### 9.3 Configure scheduler
 

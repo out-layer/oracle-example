@@ -138,16 +138,12 @@ each record are what a consumer should actually read. See [SOURCES.md](SOURCES.m
 - Mainnet: `price-oracle.near/price-oracle`
 - Testnet: `zavodil2.testnet/price-oracle`
 
-The production oracle is invoked **through the project**, not through this GitHub repository: calls
+The production oracle is invoked **through the project**: calls
 go to `POST /call/{owner}/{project}` (or on-chain with a
 `{"Project": {"project_id": "price-oracle.near/price-oracle"}}` code source), and OutLayer resolves
 both the WASM and the secrets from the project. The mainnet secrets reference is
 `{"profile": "oracle", "account_id": "price-oracle.near"}` — a profile name and an account, not a
 secret; the values themselves stay encrypted on-chain and are decrypted only inside the TEE.
-
-This matters when reading the examples below: anything that declares a `GitHub` code source binds
-its secrets to `github.com/owner/repo`, so a fork or a rename needs its secrets re-registered. The
-project path has no such coupling.
 
 **Dashboard:** https://price-oracle.outlayer.ai/
 - Live prices display
